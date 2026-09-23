@@ -1,0 +1,34 @@
+[
+  {
+    "name": "cmux-session-reset",
+    "event": "session_start",
+    "handler": { "bash": "\"${XDG_CONFIG_HOME:-$HOME/.config}/polytoken/pt-cmux/pt-cmux-status\" reset" }
+  },
+  {
+    "name": "cmux-working-prompt",
+    "event": "pre_user_prompt",
+    "handler": { "bash": "\"${XDG_CONFIG_HOME:-$HOME/.config}/polytoken/pt-cmux/pt-cmux-status\" working" }
+  },
+  {
+    "name": "cmux-working-turn",
+    "event": "pre_model_turn",
+    "handler": { "bash": "\"${XDG_CONFIG_HOME:-$HOME/.config}/polytoken/pt-cmux/pt-cmux-status\" working" }
+  },
+  {
+    "name": "cmux-needs-attention",
+    "event": "pre_tool_use",
+    "matcher": "ask_user_question",
+    "handler": { "bash": "\"${XDG_CONFIG_HOME:-$HOME/.config}/polytoken/pt-cmux/pt-cmux-status\" needs-attention" }
+  },
+  {
+    "name": "cmux-review",
+    "event": "pre_tool_use",
+    "matcher": "handoff_plan",
+    "handler": { "bash": "\"${XDG_CONFIG_HOME:-$HOME/.config}/polytoken/pt-cmux/pt-cmux-status\" review" }
+  },
+  {
+    "name": "cmux-done",
+    "event": "stop",
+    "handler": { "bash": "\"${XDG_CONFIG_HOME:-$HOME/.config}/polytoken/pt-cmux/pt-cmux-status\" done" }
+  }
+]

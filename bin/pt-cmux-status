@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# pt-cmux-status — keep the cmux per-workspace status lane in sync with the
+# Polytoken loop.
+#
+# Usage (from Polytoken hooks):  pt-cmux-status <lane>
+#   lane: working | needs-attention | review | done | reset
+#   ("reset" is the session_start hook; it maps to cmux's `auto`.)
+#
+# Contract — this script is a BLOCKING hook handler:
+#   * It ALWAYS exits 0. A nonzero exit could deny a tool call or
+#     force-loop the turn.
+#   * It NEVER writes to stdout. Exit 0 + no output = "proceed".
+#   * Every failure is swallowed and appended to the log file
+#     ($PTCMUX_LOG, default $TMPDIR/pt-cmux-status/error.log).
+#   * The event JSON on stdin is deliberately ignored; the lane arrives
+#     as an argument, so no payload field names are a dependency.
+#
+# Environment:
+#   PTCMUX_CMUX_BIN            explicit cmux binary (authoritative: if set
+#                              but not executable, cmux is treated as absent)
+#   PTCMUX_LOG                 log file path (default $TMPDIR/pt-cmux-status/error.log)
+#   PTCMUX_NOTIFY=0            disable all cmux notify calls
+#   PTCMUX_NO_WATCHER=1        never spawn the exit watcher
+#   PTCMUX_WATCHER_BIN         override path to pt-cmux-watcher
+#   PTCMUX_TEST_ANCESTOR_PIDS  tests: space-separated PIDs to watch instead
+#                              of walking real process ancestry
+#   POLYTOKEN_GOAL_ACTIVE      set by Polytoken on hook handlers
+#   PTCMUX_SET_DONE_WHEN_GOAL_ACTIVE=1  let stop set `done` while a goal runs
+#
+# Deliberately no `set -e` / `set -u`: the always-exit-0 contract matters
+# more than strictness, and this stays compatible with bash 3.2 (macOS).
+
+LANE="${1:-}"
+
+LOG_FILE="${PTCMUX_LOG:-${TMPDIR:-/tmp}/pt-cmux-status/error.log}"
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
+# 2>/dev/null first: a failed redirection (unwritable path, directory)
+# must not leak to the hook's stderr.
+if ! : 2>/dev/null >>"$LOG_FILE"; then
+  LOG_FILE=/dev/null
+fi
+
+log_error() {
+  printf '%s pt-cmux-status: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" 2>/dev/null >>"$LOG_FILE"
+}
+
+resolve_cmux() {
+  # Print the path of the cmux binary, or return 1 if none is usable.
+  if [ -n "${PTCMUX_CMUX_BIN:-}" ]; then
+    # An explicit override is authoritative so tests (and users) never hit
+    # a real cmux installation by accident. A broken override means "no cmux".
+    if [ -x "$PTCMUX_CMUX_BIN" ]; then
+      printf '%s\n' "$PTCMUX_CMUX_BIN"
+      return 0
+    fi
+    return 1
+  fi
+  found="$(command -v cmux 2>/dev/null)"
+  if [ -n "$found" ]; then
+    printf '%s\n' "$found"
+    return 0
+  fi
+  if [ -x /Applications/cmux.app/Contents/Resources/bin/cmux ]; then
+    printf '%s\n' /Applications/cmux.app/Contents/Resources/bin/cmux
+    return 0
+  fi
+  return 1
+}
+
+notify_enabled() {
+  [ "${PTCMUX_NOTIFY:-1}" != "0" ]
+}
+
+run_cmux() {
+  # run_cmux <args...>: invoke cmux, swallow stdout, log failures.
+  if ! "$CMUX" "$@" >/dev/null 2>>"$LOG_FILE"; then
+    log_error "cmux $* failed"
+  fi
+}
+
+maybe_spawn_watcher() {
+  # On session start, start one detached watcher per session that clears
+  # the lane back to `auto` once this session's Polytoken processes exit.
+  if [ "${PTCMUX_NO_WATCHER:-0}" = "1" ]; then
+    return 0
+  fi
+
+  pids=""
+  if [ -n "${PTCMUX_TEST_ANCESTOR_PIDS:-}" ]; then
+    pids="$PTCMUX_TEST_ANCESTOR_PIDS"
+  else
+    # Walk our own ancestry (up to 10 hops) and collect every ancestor whose
+    # process name mentions polytoken — those are this session's processes.
+    pid="$$"
+    hop=0
+    while [ "$hop" -lt 10 ]; do
+      hop=$((hop + 1))
+      parent="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+      [ -n "$parent" ] || break
+      if [ "$parent" = "0" ] || [ "$parent" = "1" ]; then
+        break
+      fi
+      pname="$(ps -o comm= -p "$parent" 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+      case "$pname" in
+        *polytoken*) pids="$pids $parent" ;;
+      esac
+      pid="$parent"
+    done
+  fi
+  pids="${pids# }"
+  [ -n "$pids" ] || return 0
+
+  flag_dir="${TMPDIR:-/tmp}/pt-cmux-status"
+  mkdir -p "$flag_dir" 2>/dev/null
+  if [ -n "${POLYTOKEN_SESSION_ID:-}" ]; then
+    flag="$flag_dir/watcher-$POLYTOKEN_SESSION_ID"
+  else
+    first_pid="$(printf '%s\n' "$pids" | head -n 1 | awk '{print $1}')"
+    flag="$flag_dir/watcher-pid-$first_pid"
+  fi
+
+  # Liveness-based guard: only one watcher per session. If the recorded
+  # watcher is dead (or the flag is stale), (re)spawn and overwrite.
+  # The comm check narrows PID-reuse false positives: a recycled PID that
+  # is not a pt-cmux-watcher does not suppress the respawn.
+  if [ -f "$flag" ]; then
+    old="$(cat "$flag" 2>/dev/null)"
+    if [ -n "$old" ] && kill -0 "$old" 2>/dev/null \
+      && printf '%s\n' "$(ps -o comm= -p "$old" 2>/dev/null)" | grep -q 'pt-cmux-watcher'; then
+      return 0
+    fi
+  fi
+
+  watcher_bin="${PTCMUX_WATCHER_BIN:-$(dirname "$0")/pt-cmux-watcher}"
+  if [ ! -x "$watcher_bin" ]; then
+    log_error "watcher not found or not executable: $watcher_bin"
+    return 0
+  fi
+
+  PTCMUX_WATCHER_FLAG="$flag" nohup "$watcher_bin" $pids </dev/null >>"$LOG_FILE" 2>&1 &
+  wpid=$!
+  printf '%s\n' "$wpid" 2>/dev/null >"$flag"
+}
+
+# ---------------------------------------------------------------- main ----
+
+case "$LANE" in
+  working|needs-attention|review|done|reset) ;;
+  *) exit 0 ;;
+esac
+
+CMUX="$(resolve_cmux)" || { log_error "cmux binary not found"; exit 0; }
+
+if [ "$LANE" = "reset" ]; then
+  run_cmux workspace status set auto
+  if notify_enabled; then
+    run_cmux notify --clear
+  fi
+  maybe_spawn_watcher
+  exit 0
+fi
+
+# Goal-flicker mitigation: while a saved-session goal is active the loop is
+# still running on the user's behalf, so `stop` must NOT flip the badge to
+# done — it stays on working until the goal finishes.
+if [ "$LANE" = "done" ] \
+  && [ "${POLYTOKEN_GOAL_ACTIVE:-}" = "true" ] \
+  && [ "${PTCMUX_SET_DONE_WHEN_GOAL_ACTIVE:-0}" != "1" ]; then
+  exit 0
+fi
+
+run_cmux workspace status set "$LANE"
+
+if notify_enabled; then
+  case "$LANE" in
+    needs-attention)
+      run_cmux notify --title Polytoken --body "A user question is waiting for your answer" ;;
+    review)
+      run_cmux notify --title Polytoken --body "A plan is ready for your review" ;;
+    done)
+      run_cmux notify --title Polytoken --body "Loop finished — turn handed back to you" ;;
+    working)
+      run_cmux notify --clear ;;
+  esac
+fi
+
+exit 0
