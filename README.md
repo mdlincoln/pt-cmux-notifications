@@ -1,41 +1,48 @@
 # pt-cmux-notifications
 
-Polytoken hooks that keep the cmux per-workspace status badge in sync with
-the Polytoken loop — and post cmux notifications when the loop is waiting
-on you.
+Polytoken hooks that keep the cmux sidebar status pill for Polytoken in
+sync with the Polytoken loop — and post cmux notifications when the loop
+is waiting on you.
 
 ## What it does
 
-Whenever a Polytoken session runs inside a cmux workspace, the workspace's
-status badge tracks what the session is doing:
+Whenever a Polytoken session runs inside a cmux workspace, the session's
+sidebar row shows a status pill — the same text-pill treatment native
+Claude Code sessions get — under the status key `polytoken`:
 
-| cmux lane | Polytoken hook event | Why |
-|---|---|---|
-| `working` | `pre_user_prompt`, `pre_model_turn` | A submitted prompt or an upcoming model call means the loop is running. |
-| `needs-attention` | `pre_tool_use` (`ask_user_question`) | Fires right before a user question blocks the turn. |
-| `review` | `pre_tool_use` (`handoff_plan`) | Fires right before a plan is submitted for operator review. |
-| `done` | `stop` | The model finished and the turn went back to the user. |
-| `auto` (reset) | `session_start` | Clears any stale pin from a previous session so cmux's own inference takes over until the first prompt. |
+| Pill text | cmux call | Polytoken hook event | Why |
+|---|---|---|---|
+| `Running` | `cmux set-status polytoken Running` | `pre_user_prompt`, `pre_model_turn` | A submitted prompt or an upcoming model call means the loop is running. |
+| `Needs input` | `cmux set-status polytoken "Needs input"` | `pre_tool_use` (`ask_user_question`) | Fires right before a user question blocks the turn. |
+| `In review` | `cmux set-status polytoken "In review"` | `pre_tool_use` (`handoff_plan`) | Fires right before a plan is submitted for operator review. |
+| `Idle` | `cmux set-status polytoken Idle` | `stop` | The model finished and the turn went back to the user. |
+| — (pill removed) | `cmux clear-status polytoken` | `session_start` (reset) | Clears any stale pill from a previous session. |
 
 Additionally:
 
-- **Notifications.** Transitions into `needs-attention`, `review`, and
-  `done` post a cmux notification (`cmux notify`), so waiting states are
-  visible outside the workspace. Transitions into `working` and `reset`
-  run `cmux notify --clear` so stale waiting notifications don't pile up
-  while the loop runs. Disable all of it with `PTCMUX_NOTIFY=0`.
+- **Notifications.** Transitions that leave the running state
+  (`Needs input`, `In review`, `Idle`) post a cmux notification
+  (`cmux notify`), so they are visible outside the workspace. The
+  `Running` and reset transitions run `cmux notify --clear` so stale
+  notifications don't pile up while the loop runs. Disable all of it with
+  `PTCMUX_NOTIFY=0`.
 - **Exit clearing.** Polytoken hooks have no session-exit event, so at
   `session_start` the handler spawns a detached watcher
   (`pt-cmux-watcher`) that polls the session's Polytoken process PIDs and
-  clears the lane back to `auto` once they have all exited.
+  clears the pill once they have all exited. Pills persist until cleared,
+  so this is how the pill disappears on quit.
 - **Goal-flicker mitigation.** While a saved-session goal is active, the
   loop keeps running on your behalf after every `stop`, so `stop` does
-  **not** set `done` — the badge stays `working` until the goal finishes
+  **not** set `Idle` — the pill stays `Running` until the goal finishes
   and the final turn ends without a goal active.
+- **Plain text pill.** Agent keys (e.g. `claude_code`) may get an agent
+  icon rendered next to the pill; the custom `polytoken` key renders as a
+  plain text pill. `cmux set-status` accepts `--icon`/`--color` if
+  styling is ever wanted.
 
 ## Requirements
 
-- cmux with workspace status lanes (0.64.x)
+- cmux with sidebar status pills (`cmux set-status`, 0.64.x)
 - Polytoken
 - jq — only needed by `install.sh`/`uninstall.sh` for the merge
 
@@ -76,41 +83,46 @@ duplicates entries.
 
 Removes the `cmux-*` entries from `hooks.json` (deleting the file if no
 hooks remain), removes the `pt-cmux/` script directory, and best-effort
-resets the current workspace status to `auto`.
+clears the Polytoken status pill. It also scrubs the legacy workspace
+lane pin that the previous (lane-based) version of this repo could leave
+behind — per cmux's override semantics that pin auto-clears on its own
+once the inferred lane shifts, the scrub just makes it immediate.
 
 ## Verifying in a live session (inside cmux)
 
-Start a new Polytoken session in a cmux workspace; after each step check
-`cmux workspace status` (it should report the pinned lane as an override):
+Start a new Polytoken session in a cmux workspace. After each step check
+`cmux list-status` (the `polytoken` entry should show the expected text)
+and look at the session's sidebar row, which should show the same pill
+treatment native Claude Code sessions show:
 
-1. **Prompt submitted** → lane shows `working` (pin). Also check mid-turn
-   during a long-running tool call — `pre_model_turn` keeps it pinned.
-2. **User question open** (the model calls `ask_user_question`) → lane
-   shows `needs-attention` while the question is on screen; after
-   answering, the next model turn returns it to `working`.
-3. **Plan review open** (the model calls `handoff_plan`) → lane shows
-   `review`; approving or rejecting returns it to `working` via the next
-   model turn.
-4. **Plain turn end** → lane shows `done`.
-5. **Goal-driven turn end** → lane stays `working` while the goal is
-   active; when the goal completes and the last turn ends, the lane lands
-   on `done`.
+1. **Prompt submitted** → pill shows `Running`. Also check mid-turn
+   during a long-running tool call — `pre_model_turn` keeps it set.
+2. **User question open** (the model calls `ask_user_question`) → pill
+   shows `Needs input` while the question is on screen; after answering,
+   the next model turn returns it to `Running`.
+3. **Plan review open** (the model calls `handoff_plan`) → pill shows
+   `In review`; approving or rejecting returns it to `Running` via the
+   next model turn.
+4. **Plain turn end** → pill shows `Idle`.
+5. **Goal-driven turn end** → pill stays `Running` while the goal is
+   active; when the goal completes and the last turn ends, the pill lands
+   on `Idle`.
 6. **Notifications** → each waiting-state transition (2–4) posted a
    notification, visible via `cmux list-notifications`; resuming work
-   (`working`) clears them.
-7. **Exit clearing** → quit the Polytoken session; the lane clears to
-   auto (`none (auto)`) within ~2 poll intervals. Also record what the
-   ancestry walk finds (are hook handlers children of a per-session
-   process or of a shared daemon?), and close one of two concurrent
-   Polytoken sessions while the other keeps running — if the lane stays
-   pinned, the watcher is watching a shared daemon and the per-session
-   PID refinement is needed (see design notes).
+   (`Running`) clears them.
+7. **Exit clearing** → quit the Polytoken session; the pill disappears
+   from `cmux list-status` (and from the sidebar row) within ~2 poll
+   intervals. Also record what the ancestry walk finds (are hook handlers
+   children of a per-session process or of a shared daemon?), and close
+   one of two concurrent Polytoken sessions while the other keeps running
+   — if the pill survives, the watcher is watching a shared daemon and
+   the per-session PID refinement is needed (see design notes).
 8. **Hook load check** → start a new session and submit one prompt; no
    hook-related error or warning should appear in the session's visible
    output surface.
-9. **Background-job wake observation** → trigger a user question while
-   a background job is running; note whether a `pre_model_turn` wake
-   briefly overrides `needs-attention` (expected to be rare and
+9. **Background-job wake observation** → trigger a user question while a
+   background job is running; note whether a `pre_model_turn` wake
+   briefly flips the pill back to `Running` (expected to be rare and
    self-healing).
 
 ## Configuration
@@ -136,7 +148,7 @@ Any project can disable individual hooks via a project-level
 |---|---|
 | `PTCMUX_NOTIFY=0` | Disable all notification posts and clears. |
 | `PTCMUX_NO_WATCHER=1` | Never spawn the exit watcher. |
-| `PTCMUX_SET_DONE_WHEN_GOAL_ACTIVE=1` | Let `stop` set `done` even while a goal is active (restores per-turn done-flicker). |
+| `PTCMUX_SET_DONE_WHEN_GOAL_ACTIVE=1` | Let `stop` set `Idle` even while a goal is active (restores per-turn idle flicker). |
 | `PTCMUX_CMUX_BIN` | Explicit cmux binary. Authoritative: if set but not executable, cmux is treated as absent. |
 | `PTCMUX_WATCHER_BIN` | Override the path to `pt-cmux-watcher`. |
 | `PTCMUX_WATCH_INTERVAL` | Watcher poll interval in seconds (default 2). |
@@ -144,34 +156,35 @@ Any project can disable individual hooks via a project-level
 
 ## Notifications & exit clearing — details
 
-- Notification bodies: `needs-attention` → "A user question is waiting for
-  your answer"; `review` → "A plan is ready for your review"; `done` →
-  "Loop finished — turn handed back to you".
-- `done` posts a notification **on every turn end** (by design). The
-  `notify --clear` on the next `working` keeps accumulation bounded to the
-  idle window.
+- Notification bodies: `cmux-needs-attention` → "A user question is
+  waiting for your answer"; `cmux-review` → "A plan is ready for your
+  review"; `cmux-done` → "Loop finished — turn handed back to you".
+- `Idle` posts a notification on each turn end that reaches it — the goal
+  gate suppresses the transition entirely while a goal is active (by
+  design). The `notify --clear` on the next `Running` set keeps
+  accumulation bounded to the idle window.
 - `cmux notify --clear` clears **all** notifications for the workspace,
   not only ours — third-party workspace notifications are cleared too.
 - The exit watcher: at `session_start` the handler walks its own process
   ancestry (`ps`) and collects every ancestor whose process name mentions
   `polytoken`; the detached watcher polls those PIDs (every
-  `PTCMUX_WATCH_INTERVAL` seconds) and pins `auto` once they have all
-  exited. If no Polytoken ancestor can be identified, no watcher starts —
-  the next session's `reset` still cleans any stale pin.
+  `PTCMUX_WATCH_INTERVAL` seconds) and clears the status pill once they
+  have all exited. If no Polytoken ancestor can be identified, no watcher
+  starts — the next session's reset still clears any stale pill.
 - Known granularity caveat: if hook handlers are spawned by a long-lived
   shared daemon rather than the per-session TUI process, the watcher fires
-  only when that daemon exits, leaving a stale pin after closing one of
+  only when that daemon exits, leaving a stale pill after closing one of
   several sessions. It degrades gracefully (no spurious clears; the next
-  session's reset re-cleans), and the live checklist records the actual
-  granularity. Converse races (a previous session's watcher clearing a
-  moment after a new session pins) self-heal within one model turn because
-  every event re-pins.
+  session's reset re-clears), and the live checklist records the actual
+  granularity. Converse races (a previous session's watcher clearing the
+  pill a moment after a new session sets it) self-heal within one model
+  turn because every event re-sets the pill.
 
 ## Design notes
 
 - **Only blocking events are used.** Fire-and-forget events
   (`post_tool_use`, `post_model_turn`) can complete after a later `stop`
-  handler's cmux call and land the badge on the wrong lane. Blocking
+  handler's cmux call and land the pill on the wrong state. Blocking
   events run inline in loop order, so state transitions serialize.
 - **The handler never blocks or fails the loop.** On the events used here,
   a hook `error` outcome stops the guarded action entirely. The handler
@@ -184,17 +197,19 @@ Any project can disable individual hooks via a project-level
   This is a deliberate simplicity trade-off (macOS has no `timeout(1)`
   by default and a background-and-kill wrapper adds its own failure
   modes).
-- **No dedup state file — re-pin on every event.** cmux manual pins can
-  auto-expire when cmux's inference shifts; re-pinning on every hook fire
-  keeps the badge correct over long single-lane stretches. The cmux call
-  is a ~ms local round trip at most once per model turn, so there is
-  nothing meaningful to dedup.
+- **No dedup state file — re-set the pill on every event.** Pills persist
+  until cleared, so this repo owns the full lifecycle: each event sets
+  the pill, and reset, session exit, and uninstall clear it. Re-setting
+  on every event is kept so a manually cleared pill self-restores on the
+  next event (documented behavior). The cmux call is a ~ms local round
+  trip at most once per model turn, so there is nothing meaningful to
+  dedup.
 - **Event payload independence.** The handler ignores the event JSON on
-  stdin entirely; the lane arrives as a CLI argument, so no hook payload
-  field names are a dependency.
-- **Goal flicker.** `POLYTOKEN_GOAL_ACTIVE` gates `stop`→`done` so
-  goal-driven sessions don't strobe `working → done → working` on every
-  auto-continued turn (see above).
+  stdin entirely; the state selector arrives as a CLI argument, so no
+  hook payload field names are a dependency.
+- **Goal flicker.** `POLYTOKEN_GOAL_ACTIVE` gates `stop`→`Idle` so
+  goal-driven sessions don't strobe `Running → Idle → Running` on every
+  continued turn (see above).
 
 ## Development
 
@@ -202,6 +217,6 @@ Any project can disable individual hooks via a project-level
 bash tests/run_tests.sh
 ```
 
-Runs the full unit suite (handler contract, lane values, goal gate,
+Runs the full unit suite (handler contract, pill values, goal gate,
 install/uninstall merge, notifications, watcher) against a fake cmux
 shim — nothing touches the real cmux or the real Polytoken config.

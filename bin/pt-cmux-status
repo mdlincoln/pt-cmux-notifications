@@ -1,10 +1,27 @@
 #!/usr/bin/env bash
-# pt-cmux-status — keep the cmux per-workspace status lane in sync with the
-# Polytoken loop.
+# pt-cmux-status — keep the cmux sidebar status pill for Polytoken in sync
+# with the Polytoken loop.
 #
 # Usage (from Polytoken hooks):  pt-cmux-status <lane>
 #   lane: working | needs-attention | review | done | reset
-#   ("reset" is the session_start hook; it maps to cmux's `auto`.)
+#
+# The lane argument maps to cmux's sidebar status pill surface (the same
+# text-pill treatment native Claude Code sessions get), keyed `polytoken`:
+#
+#   lane             cmux call
+#   ---------------  ---------------------------------------------
+#   working          cmux set-status polytoken Running
+#   needs-attention  cmux set-status polytoken "Needs input"
+#   review           cmux set-status polytoken "In review"
+#   done             cmux set-status polytoken Idle
+#   reset            cmux clear-status polytoken
+#
+# Multi-word pill texts are always ONE argv word (quoted in the table for
+# clarity); an unquoted multi-word literal would send cmux a stray
+# positional argument and the call would fail. Workspace status lanes
+# (`cmux workspace status ...`) are never touched: lanes are the user's
+# manual surface, and the sidebar status pill is the supported agent
+# surface.
 #
 # Contract — this script is a BLOCKING hook handler:
 #   * It ALWAYS exits 0. A nonzero exit could deny a tool call or
@@ -80,7 +97,7 @@ run_cmux() {
 
 maybe_spawn_watcher() {
   # On session start, start one detached watcher per session that clears
-  # the lane back to `auto` once this session's Polytoken processes exit.
+  # the Polytoken status pill once this session's Polytoken processes exit.
   if [ "${PTCMUX_NO_WATCHER:-0}" = "1" ]; then
     return 0
   fi
@@ -152,7 +169,7 @@ esac
 CMUX="$(resolve_cmux)" || { log_error "cmux binary not found"; exit 0; }
 
 if [ "$LANE" = "reset" ]; then
-  run_cmux workspace status set auto
+  run_cmux clear-status polytoken
   if notify_enabled; then
     run_cmux notify --clear
   fi
@@ -161,15 +178,32 @@ if [ "$LANE" = "reset" ]; then
 fi
 
 # Goal-flicker mitigation: while a saved-session goal is active the loop is
-# still running on the user's behalf, so `stop` must NOT flip the badge to
-# done — it stays on working until the goal finishes.
+# still running on the user's behalf, so `stop` must NOT flip the pill to
+# Idle — it stays on Running until the goal finishes.
 if [ "$LANE" = "done" ] \
   && [ "${POLYTOKEN_GOAL_ACTIVE:-}" = "true" ] \
   && [ "${PTCMUX_SET_DONE_WHEN_GOAL_ACTIVE:-0}" != "1" ]; then
   exit 0
 fi
 
-run_cmux workspace status set "$LANE"
+# Resolve the pill text to ONE argv word, even when it contains a space.
+# An unquoted multi-word literal would parse as key=polytoken, value=Needs,
+# plus an unknown positional `input` — a usage error, swallowed to the log,
+# and the pill would never set.
+case "$LANE" in
+  working)         pill=Running ;;
+  needs-attention) pill='Needs input' ;;
+  review)          pill='In review' ;;
+  done)            pill=Idle ;;
+  *)
+    # Unreachable today (the lane validity check above gates it), but a
+    # future lane added to that list without a text here would otherwise
+    # silently set an empty pill.
+    log_error "unhandled lane: $LANE"
+    exit 0 ;;
+esac
+
+run_cmux set-status polytoken "$pill"
 
 if notify_enabled; then
   case "$LANE" in

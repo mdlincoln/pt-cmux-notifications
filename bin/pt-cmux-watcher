@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # pt-cmux-watcher — detached helper spawned by pt-cmux-status at session
 # start. Polls the given PIDs until every one has exited, then clears the
-# cmux workspace status pin back to `auto` (Polytoken hooks have no
-# session-exit event, so this is how the lane is unpinned on exit).
+# cmux sidebar status pill for Polytoken (Polytoken hooks have no
+# session-exit event, so this is how the pill is removed on exit).
 #
 # Usage: pt-cmux-watcher <pid> [<pid> ...]
 #
 # The watcher is intentionally dumb: it owns no state, makes exactly one
 # cmux call at the end of its life, and can be killed at any time without
-# leaving anything behind (worst case: a stale pin, which the next
+# leaving anything behind (worst case: a stale pill, which the next
 # session's reset clears).
 #
 # Contract: ALWAYS exits 0 and NEVER writes to stdout.
@@ -74,8 +74,8 @@ while :; do
 done
 
 if CMUX="$(resolve_cmux)"; then
-  if ! "$CMUX" workspace status set auto >/dev/null 2>>"$LOG_FILE"; then
-    log_error "cmux workspace status set auto failed"
+  if ! "$CMUX" clear-status polytoken >/dev/null 2>>"$LOG_FILE"; then
+    log_error "cmux clear-status polytoken failed"
   fi
 else
   log_error "cmux binary not found"

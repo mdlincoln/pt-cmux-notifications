@@ -4,8 +4,9 @@
 # * Strips cmux-* entries from ${XDG_CONFIG_HOME:-$HOME/.config}/polytoken/hooks.json
 #   (deleting the file if no hooks remain).
 # * Removes the polytoken/pt-cmux/ script directory.
-# * Best-effort: un-pins the current cmux workspace status (honors
-#   PTCMUX_CMUX_BIN).
+# * Best-effort: clears the cmux sidebar status pill for Polytoken and
+#   scrubs any legacy workspace lane pin left by an older version
+#   (honors PTCMUX_CMUX_BIN).
 
 set -eu
 
@@ -58,7 +59,7 @@ fi
 rm -rf "$CONFIG_DIR/pt-cmux"
 echo "removed $CONFIG_DIR/pt-cmux/"
 
-# Best-effort: un-pin the current workspace. PTCMUX_CMUX_BIN is honored
+# Best-effort cleanup of both status surfaces. PTCMUX_CMUX_BIN is honored
 # with the same authoritative semantics as the hook handler, so tests (and
 # users) never hit a real cmux installation by accident.
 cmux_bin=""
@@ -73,8 +74,19 @@ else
   fi
 fi
 if [ -n "$cmux_bin" ]; then
-  "$cmux_bin" workspace status set auto >/dev/null 2>&1 || true
-  echo "workspace status reset to auto"
+  if "$cmux_bin" clear-status polytoken >/dev/null 2>&1; then
+    echo "cleared the Polytoken status pill"
+  else
+    echo "warning: could not clear the Polytoken status pill" >&2
+  fi
+  # Legacy scrub: a lane pin left by the previously installed version of
+  # this repo auto-clears per cmux's own override expiry; this just makes
+  # it immediate.
+  if "$cmux_bin" workspace status set auto >/dev/null 2>&1; then
+    echo "scrubbed legacy workspace lane pin (if any)"
+  else
+    echo "warning: could not scrub the legacy workspace lane pin" >&2
+  fi
 fi
 
 echo "uninstalled."

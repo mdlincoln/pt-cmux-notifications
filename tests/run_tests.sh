@@ -7,7 +7,7 @@
 # Run: bash tests/run_tests.sh   (nonzero exit on any failure)
 #
 # Case numbering follows the plan:
-#   1–9   script cases (pt-cmux-status handler contract + lane values)
+#   1–9   script cases (pt-cmux-status handler contract + pill values)
 #   10–13 install/uninstall cases
 #   14–18 notification and watcher cases
 
@@ -35,7 +35,9 @@ ALL_TMP=""
 TEST_TMP=""
 TEST_LOG_DIR=""
 CALLS=""
+CALLS_ARGS=""
 SHIM=""
+RECORDED_CALLS=""
 
 note() { PASS=$((PASS + 1)); printf 'ok   %s\n' "$1"; }
 bail() { FAIL=$((FAIL + 1)); printf 'FAIL %s\n' "$1"; }
@@ -45,15 +47,26 @@ setup() {
   ALL_TMP="$ALL_TMP $TEST_TMP"
   TEST_LOG_DIR="$TEST_TMP/log"
   CALLS="$TEST_TMP/calls.log"
+  CALLS_ARGS="$TEST_TMP/calls.args"
   SHIM="$TEST_TMP/cmux"
   mkdir -p "$TEST_TMP/tmp" "$TEST_TMP/home" "$TEST_TMP/xdg" "$TEST_LOG_DIR"
   : >"$CALLS"
+  : >"$CALLS_ARGS"
   cat >"$SHIM" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$CALLS"
+printf '%s\n' "\$#" >> "$CALLS_ARGS"
 exit \${PTCMUX_TEST_SHIM_EXIT:-0}
 EOF
   chmod +x "$SHIM"
+}
+
+remember_calls() {
+  # Record the current case's call log for the negative lane assertion at
+  # the end of the suite. Install/uninstall cases are NOT recorded: the
+  # only lane command in the whole suite is uninstall's legacy scrub,
+  # which is pinned to exactly one occurrence by case 13's own assertion.
+  RECORDED_CALLS="$RECORDED_CALLS $CALLS"
 }
 
 run_status() (
@@ -89,6 +102,15 @@ count() {
   grep -c -- "$1" "$CALLS" 2>/dev/null || true
 }
 
+# Argument-count side log: how many argv words each shim call received.
+# `set-status polytoken "Needs input"` logs 3; a word-split
+# `set-status polytoken Needs input` would log 4. The "$*" call log
+# renders both identically, so the argv-integrity assertions below use
+# this side log to pin the quoting of multi-word pill texts.
+count_args() {
+  grep -c -- "$1" "$CALLS_ARGS" 2>/dev/null || true
+}
+
 lines() {
   wc -l <"$CALLS" 2>/dev/null | tr -d ' ' || printf '0'
 }
@@ -120,48 +142,56 @@ trap cleanup EXIT
 
 # ------------------------------------------------------- script cases -----
 
-# 1. working on a fresh session -> one working pin.
+# 1. working on a fresh session -> one Running pill.
 setup
+remember_calls
 out="$(run_status working 2>/dev/null)"; rc=$?
 assert_handler_contract "$rc" "$out" "case 1: working on fresh session"
-if [ "$(count '^workspace status set working$')" -eq 1 ]; then
-  note "case 1: lane pinned to working exactly once"
+if [ "$(count '^set-status polytoken Running$')" -eq 1 ]; then
+  note "case 1: pill set to Running exactly once"
 else
-  bail "case 1: expected one working pin, log: $(cat "$CALLS")"
+  bail "case 1: expected one Running set, log: $(cat "$CALLS")"
 fi
 
-# 2. working again -> pinned again (re-pin on every invocation).
+# 2. working again -> set again (re-set on every invocation).
 out="$(run_status working 2>/dev/null)"; rc=$?
-assert_handler_contract "$rc" "$out" "case 2: working pinned again"
-if [ "$(count '^workspace status set working$')" -eq 2 ]; then
-  note "case 2: repeat invocation re-pins working (no dedup)"
+assert_handler_contract "$rc" "$out" "case 2: Working set again"
+if [ "$(count '^set-status polytoken Running$')" -eq 2 ]; then
+  note "case 2: repeat invocation re-sets Running (no dedup)"
 else
-  bail "case 2: expected two working pins, log: $(cat "$CALLS")"
+  bail "case 2: expected two Running sets, log: $(cat "$CALLS")"
 fi
 
 # 3. needs-attention after working.
+args3_before="$(count_args '^3$')"
 out="$(run_status needs-attention 2>/dev/null)"; rc=$?
 assert_handler_contract "$rc" "$out" "case 3: needs-attention"
-if [ "$(count '^workspace status set needs-attention$')" -eq 1 ]; then
-  note "case 3: lane pinned to needs-attention"
+if [ "$(count '^set-status polytoken Needs input$')" -eq 1 ]; then
+  note "case 3: pill set to Needs input"
 else
-  bail "case 3: expected needs-attention pin, log: $(cat "$CALLS")"
+  bail "case 3: expected a Needs input set, log: $(cat "$CALLS")"
+fi
+args3_after="$(count_args '^3$')"
+if [ "$((args3_after - args3_before))" -eq 1 ]; then
+  note "case 3: set-status received exactly 3 argv (quoted multi-word pill)"
+else
+  bail "case 3: expected one 3-argv set-status call, got $((args3_after - args3_before)) (word-split?)"
 fi
 
-# 4. reset -> auto; a following working still fires a new pin.
+# 4. reset -> clear-status; a following working still fires a new set.
 out="$(run_status reset 2>/dev/null)"; rc=$?
 assert_handler_contract "$rc" "$out" "case 4: reset"
-if [ "$(count '^workspace status set auto$')" -eq 1 ]; then
-  note "case 4: reset pins auto"
+if [ "$(count '^clear-status polytoken$')" -eq 1 ]; then
+  note "case 4: reset clears the pill"
 else
-  bail "case 4: expected auto pin, log: $(cat "$CALLS")"
+  bail "case 4: expected one clear-status, log: $(cat "$CALLS")"
 fi
 out="$(run_status working 2>/dev/null)"; rc=$?
 assert_handler_contract "$rc" "$out" "case 4b: working after reset"
-if [ "$(count '^workspace status set working$')" -eq 3 ]; then
-  note "case 4b: working after reset fires a new pin"
+if [ "$(count '^set-status polytoken Running$')" -eq 3 ]; then
+  note "case 4b: working after reset fires a new Running set"
 else
-  bail "case 4b: expected a fresh working pin, log: $(cat "$CALLS")"
+  bail "case 4b: expected a fresh Running set, log: $(cat "$CALLS")"
 fi
 
 # 5. done with an active goal -> no cmux call at all.
@@ -170,18 +200,25 @@ out="$(run_status done POLYTOKEN_GOAL_ACTIVE=true 2>/dev/null)"; rc=$?
 assert_handler_contract "$rc" "$out" "case 5: done while goal active"
 after="$(lines)"
 if [ "$before" -eq "$after" ]; then
-  note "case 5: goal-active stop does not touch the badge"
+  note "case 5: goal-active stop does not touch the pill"
 else
   bail "case 5: expected no shim calls, log: $(cat "$CALLS")"
 fi
 
-# 6. done with no goal -> done pin + notification.
+# 6. done with no goal -> Idle pill + notification.
+args3_before="$(count_args '^3$')"
 out="$(run_status done POLYTOKEN_GOAL_ACTIVE=false 2>/dev/null)"; rc=$?
 assert_handler_contract "$rc" "$out" "case 6: done with no goal"
-if [ "$(count '^workspace status set done$')" -eq 1 ]; then
-  note "case 6: lane pinned to done"
+if [ "$(count '^set-status polytoken Idle$')" -eq 1 ]; then
+  note "case 6: pill set to Idle"
 else
-  bail "case 6: expected done pin, log: $(cat "$CALLS")"
+  bail "case 6: expected an Idle set, log: $(cat "$CALLS")"
+fi
+args3_after="$(count_args '^3$')"
+if [ "$((args3_after - args3_before))" -eq 1 ]; then
+  note "case 6: set-status received exactly 3 argv"
+else
+  bail "case 6: expected one 3-argv set-status call, got $((args3_after - args3_before)) (word-split?)"
 fi
 if [ "$(count '^notify --title Polytoken --body Loop finished')" -eq 1 ]; then
   note "case 6: done posts its notification"
@@ -192,14 +229,15 @@ fi
 # 6b. escape hatch: done while goal active with PTCMUX_SET_DONE_WHEN_GOAL_ACTIVE=1.
 out="$(run_status done POLYTOKEN_GOAL_ACTIVE=true PTCMUX_SET_DONE_WHEN_GOAL_ACTIVE=1 2>/dev/null)"; rc=$?
 assert_handler_contract "$rc" "$out" "case 6b: SET_DONE_WHEN_GOAL_ACTIVE escape hatch"
-if [ "$(count '^workspace status set done$')" -eq 2 ]; then
-  note "case 6b: done is pinned despite the active goal"
+if [ "$(count '^set-status polytoken Idle$')" -eq 2 ]; then
+  note "case 6b: Idle set despite the active goal"
 else
-  bail "case 6b: expected a done pin, log: $(cat "$CALLS")"
+  bail "case 6b: expected an Idle set, log: $(cat "$CALLS")"
 fi
 
 # 7. cmux missing entirely (override dead, no cmux on PATH) -> exit 0, silent.
 setup
+remember_calls
 out="$(run_status working PATH=/usr/bin:/bin PTCMUX_CMUX_BIN="$TEST_TMP/no-such-cmux" 2>/dev/null)"; rc=$?
 assert_handler_contract "$rc" "$out" "case 7: cmux missing"
 if [ "$(lines)" -eq 0 ]; then
@@ -210,6 +248,7 @@ fi
 
 # 8. cmux errors (shim exits 1) -> handler still exits 0, silent.
 setup
+remember_calls
 out="$(run_status working PTCMUX_TEST_SHIM_EXIT=1 2>/dev/null)"; rc=$?
 assert_handler_contract "$rc" "$out" "case 8: cmux exits nonzero"
 if [ -s "$TEST_LOG_DIR/error.log" ]; then
@@ -220,12 +259,13 @@ fi
 
 # 9. arbitrary JSON on stdin is ignored.
 setup
+remember_calls
 out="$(printf '{"session_id":"s","tool_input":{"q":"hi"}}' | run_status working 2>/dev/null)"; rc=$?
 assert_handler_contract "$rc" "$out" "case 9: stdin JSON ignored"
-if [ "$(count '^workspace status set working$')" -eq 1 ]; then
-  note "case 9: lane pinned despite (unrelated) stdin payload"
+if [ "$(count '^set-status polytoken Running$')" -eq 1 ]; then
+  note "case 9: Running set despite (unrelated) stdin payload"
 else
-  bail "case 9: expected a working pin, log: $(cat "$CALLS")"
+  bail "case 9: expected a Running set, log: $(cat "$CALLS")"
 fi
 
 # ----------------------------------------------------- install cases -----
@@ -306,7 +346,8 @@ else
   bail "case 12: no backup found or backup content wrong (found: ${backup:-none})"
 fi
 
-# 13. uninstall removes cmux-* entries, keeps third-party, deletes pt-cmux/.
+# 13. uninstall removes cmux-* entries, keeps third-party, deletes pt-cmux/,
+#     and cleans up both status surfaces via the shim.
 setup
 seed_third_party
 run_install >/dev/null 2>&1
@@ -318,6 +359,12 @@ if run_uninstall >/dev/null 2>&1; then
     note "case 13: uninstall strips cmux-*, keeps third-party, removes pt-cmux/"
   else
     bail "case 13: unexpected uninstall state ($(cat "$hooks_json" 2>/dev/null))"
+  fi
+  if [ "$(count '^clear-status polytoken$')" -eq 1 ] \
+     && [ "$(count '^workspace status set auto$')" -eq 1 ]; then
+    note "case 13: uninstall cleared the pill and scrubbed the legacy lane exactly once each"
+  else
+    bail "case 13: expected one clear-status polytoken and one legacy lane scrub, log: $(cat "$CALLS")"
   fi
 else
   bail "case 13: uninstall.sh failed"
@@ -333,10 +380,29 @@ else
   bail "case 13b: expected hooks.json and pt-cmux/ gone"
 fi
 
+# 13c. uninstall leaves an invalid hooks.json untouched (warning path).
+setup
+mkdir -p "$TEST_TMP/xdg/polytoken"
+printf '%s\n' '{"invalid":true}' >"$TEST_TMP/xdg/polytoken/hooks.json"
+seed_content="$(cat "$TEST_TMP/xdg/polytoken/hooks.json")"
+if run_uninstall >/dev/null 2>&1; then
+  hooks_json="$TEST_TMP/xdg/polytoken/hooks.json"
+  if [ -f "$hooks_json" ] && [ "$(cat "$hooks_json")" = "$seed_content" ]; then
+    note "case 13c: invalid hooks.json left untouched (warning path)"
+  else
+    bail "case 13c: hooks.json was modified or removed"
+  fi
+else
+  bail "case 13c: uninstall.sh failed"
+fi
+
 # ---------------------------------------------- notification/watcher -----
 
-# 14. waiting lanes post notifications; working/reset clear them.
+# 14. waiting lanes post notifications; working/reset clear them; each
+#     set-status call carries exactly 3 argv (quoted multi-word pills).
 setup
+remember_calls
+args3_before="$(count_args '^3$')"
 run_status needs-attention >/dev/null 2>&1
 run_status review >/dev/null 2>&1
 run_status done POLYTOKEN_GOAL_ACTIVE=false >/dev/null 2>&1
@@ -350,9 +416,21 @@ if [ "$(count '^notify --title Polytoken --body A user question is waiting for y
 else
   bail "case 14: unexpected notify log: $(cat "$CALLS")"
 fi
+if [ "$(count '^set-status polytoken In review$')" -eq 1 ]; then
+  note "case 14: review set the In review pill"
+else
+  bail "case 14: expected one In review set, log: $(cat "$CALLS")"
+fi
+args3_after="$(count_args '^3$')"
+if [ "$((args3_after - args3_before))" -eq 4 ]; then
+  note "case 14: all four set-status calls carried exactly 3 argv"
+else
+  bail "case 14: expected four 3-argv set-status calls, got $((args3_after - args3_before)) (word-split?)"
+fi
 
 # 15. PTCMUX_NOTIFY=0 -> no notify calls at all.
 setup
+remember_calls
 run_status needs-attention PTCMUX_NOTIFY=0 >/dev/null 2>&1
 run_status working PTCMUX_NOTIFY=0 >/dev/null 2>&1
 run_status reset PTCMUX_NOTIFY=0 >/dev/null 2>&1
@@ -362,8 +440,9 @@ else
   bail "case 15: expected no notify calls, log: $(cat "$CALLS")"
 fi
 
-# 16. watcher spawns on reset and clears the lane when the watched PID dies.
+# 16. watcher spawns on reset and clears the pill when the watched PID dies.
 setup
+remember_calls
 sleep 60 & spid=$!
 out="$(run_status reset PTCMUX_TEST_ANCESTOR_PIDS="$spid" PTCMUX_WATCH_INTERVAL=1 2>/dev/null)"; rc=$?
 assert_handler_contract "$rc" "$out" "case 16: reset with test ancestor"
@@ -385,40 +464,42 @@ else
   kill "$spid" 2>/dev/null; wait "$spid" 2>/dev/null
   bail "case 16: watcher PID in flag is not live"
 fi
-auto_before="$(count '^workspace status set auto$')"
-if [ "$auto_before" -ge 1 ]; then
-  : # reset already pinned auto once — expected
+clear_before="$(count '^clear-status polytoken$')"
+if [ "$clear_before" -eq 1 ]; then
+  : # reset already cleared the pill once — expected
 else
   kill "$spid" 2>/dev/null; wait "$spid" 2>/dev/null
-  bail "case 16: reset should already have pinned auto once"
+  bail "case 16: reset should already have cleared the pill exactly once (got $clear_before)"
 fi
 kill "$spid" 2>/dev/null
 wait "$spid" 2>/dev/null
 i=0
-auto_after="$auto_before"
-while [ "$i" -lt 100 ] && [ "$auto_after" -lt $((auto_before + 1)) ]; do
+clear_after="$clear_before"
+while [ "$i" -lt 100 ] && [ "$clear_after" -lt $((clear_before + 1)) ]; do
   i=$((i + 1)); sleep 0.1
-  auto_after="$(count '^workspace status set auto$')"
+  clear_after="$(count '^clear-status polytoken$')"
 done
-if [ "$auto_after" -eq $((auto_before + 1)) ]; then
-  note "case 16: watcher pinned auto exactly once after watched PID exited"
+if [ "$clear_after" -eq $((clear_before + 1)) ]; then
+  note "case 16: watcher cleared the pill exactly once after watched PID exited"
 else
-  bail "case 16: expected auto count $((auto_before + 1)), got $auto_after; log: $(cat "$CALLS")"
+  bail "case 16: expected clear count $((clear_before + 1)), got $clear_after; log: $(cat "$CALLS")"
 fi
 
 # 17. PTCMUX_NO_WATCHER=1 -> no watcher, no flag file.
 setup
+remember_calls
 out="$(run_status reset PTCMUX_NO_WATCHER=1 2>/dev/null)"; rc=$?
 assert_handler_contract "$rc" "$out" "case 17: reset with watcher disabled"
 flag="$TEST_TMP/tmp/pt-cmux-status/watcher-test-session"
-if [ ! -e "$flag" ] && [ "$(count '^workspace status set auto$')" -eq 1 ]; then
-  note "case 17: no watcher spawned, lane still pinned to auto"
+if [ ! -e "$flag" ] && [ "$(count '^clear-status polytoken$')" -eq 1 ]; then
+  note "case 17: no watcher spawned, pill still cleared"
 else
   bail "case 17: watcher was spawned or reset misbehaved (flag: $flag)"
 fi
 
 # 18. watcher with no PIDs exits silently; all-dead-at-startup clears once.
 setup
+remember_calls
 before="$(lines)"
 out="$(run_watcher 2>/dev/null)"; rc=$?
 assert_handler_contract "$rc" "$out" "case 18a: watcher with no arguments"
@@ -435,15 +516,16 @@ if kill -0 "$dead" 2>/dev/null; then
 else
   out="$(run_watcher "$dead" 2>/dev/null)"; rc=$?
   assert_handler_contract "$rc" "$out" "case 18b: watcher with already-reaped PID"
-  if [ "$(count '^workspace status set auto$')" -eq 1 ]; then
-    note "case 18b: all-dead-at-startup pins auto exactly once"
+  if [ "$(count '^clear-status polytoken$')" -eq 1 ]; then
+    note "case 18b: all-dead-at-startup clears the pill exactly once"
   else
-    bail "case 18b: expected exactly one auto pin, log: $(cat "$CALLS")"
+    bail "case 18b: expected exactly one clear-status, log: $(cat "$CALLS")"
   fi
 fi
 
 # 20. watcher tolerates a missing cmux binary (exit 0, silent, no calls).
 setup
+remember_calls
 sleep 0.3 & dead=$!
 wait "$dead" 2>/dev/null
 if ! kill -0 "$dead" 2>/dev/null; then
@@ -460,6 +542,7 @@ fi
 
 # 20b. watcher tolerates a failing cmux (exit 0, silent).
 setup
+remember_calls
 sleep 0.3 & dead=$!
 wait "$dead" 2>/dev/null
 if ! kill -0 "$dead" 2>/dev/null; then
@@ -486,6 +569,29 @@ if [ "$(jq '[.[] | select((.name // "") | startswith("cmux-"))] | length' "$hook
   note "case 19: install twice is idempotent (6 cmux-* + third-party preserved)"
 else
   bail "case 19: unexpected double-install result: $(cat "$hooks_json")"
+fi
+
+# ------------------------------------------------ negative lane check ----
+
+# No handler/watcher path may emit a workspace status lane command: lanes
+# are the user's manual surface. The only lane command in the whole suite
+# is uninstall's legacy scrub, whose log lives in its own temp dir and is
+# not in RECORDED_CALLS (case 13 pins it to exactly one occurrence).
+lane_hits=""
+n_logs=0
+for f in $RECORDED_CALLS; do
+  n_logs=$((n_logs + 1))
+  hit="$(grep -h '^workspace status set' "$f" 2>/dev/null || true)"
+  if [ -n "$hit" ]; then
+    lane_hits="$lane_hits $hit"
+  fi
+done
+if [ -n "$lane_hits" ]; then
+  bail "negative: handler/watcher path emitted a lane command: $lane_hits"
+elif [ "$n_logs" -ge 11 ]; then
+  note "negative: no handler/watcher call log ($n_logs logs) contains a lane command"
+else
+  bail "negative: only $n_logs handler/watcher call logs recorded (expected >= 11)"
 fi
 
 # ------------------------------------------------------------ summary -----
