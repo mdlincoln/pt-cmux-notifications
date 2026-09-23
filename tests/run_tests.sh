@@ -10,6 +10,7 @@
 #   1–9   script cases (pt-cmux-status handler contract + pill values)
 #   10–13 install/uninstall cases
 #   14–18 notification and watcher cases
+#   19–21 idempotency, watcher tolerance, styled-pill fallback
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
 STATUS="$ROOT/bin/pt-cmux-status"
@@ -22,6 +23,7 @@ BASE_TMP="${TMPDIR:-/tmp}"
 unset PTCMUX_CMUX_BIN PTCMUX_LOG PTCMUX_NOTIFY PTCMUX_NO_WATCHER \
       PTCMUX_WATCHER_BIN PTCMUX_WATCH_INTERVAL PTCMUX_TEST_ANCESTOR_PIDS \
       PTCMUX_SET_DONE_WHEN_GOAL_ACTIVE PTCMUX_TEST_SHIM_EXIT \
+      PTCMUX_TEST_SHIM_FAIL_ICON \
       POLYTOKEN_SESSION_ID POLYTOKEN_GOAL_ACTIVE 2>/dev/null
 
 if ! command -v jq >/dev/null 2>&1 && [ ! -x /opt/homebrew/bin/jq ]; then
@@ -56,6 +58,16 @@ setup() {
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$CALLS"
 printf '%s\n' "\$#" >> "$CALLS_ARGS"
+# PTCMUX_TEST_SHIM_FAIL_ICON=1: fail only styling-capable calls (any
+# argv containing --icon), after logging — mimics an older cmux build
+# that rejects the styling flags.
+if [ "\${PTCMUX_TEST_SHIM_FAIL_ICON:-0}" = "1" ]; then
+  for a in "\$@"; do
+    if [ "\$a" = "--icon" ]; then
+      exit 1
+    fi
+  done
+fi
 exit \${PTCMUX_TEST_SHIM_EXIT:-0}
 EOF
   chmod +x "$SHIM"
@@ -103,8 +115,9 @@ count() {
 }
 
 # Argument-count side log: how many argv words each shim call received.
-# `set-status polytoken "Needs input"` logs 3; a word-split
-# `set-status polytoken Needs input` would log 4. The "$*" call log
+# `set-status polytoken "Needs input" --icon bell.fill --color '#FF9500'`
+# logs 7 (the multi-word pill is still ONE of them); a word-split
+# `set-status polytoken Needs input ...` would log 8. The "$*" call log
 # renders both identically, so the argv-integrity assertions below use
 # this side log to pin the quoting of multi-word pill texts.
 count_args() {
@@ -142,40 +155,55 @@ trap cleanup EXIT
 
 # ------------------------------------------------------- script cases -----
 
-# 1. working on a fresh session -> one Running pill.
+# 1. working on a fresh session -> one Running pill (styled).
 setup
 remember_calls
 out="$(run_status working 2>/dev/null)"; rc=$?
 assert_handler_contract "$rc" "$out" "case 1: working on fresh session"
-if [ "$(count '^set-status polytoken Running$')" -eq 1 ]; then
-  note "case 1: pill set to Running exactly once"
+if [ "$(count '^set-status polytoken Running --icon bolt.fill --color #4C8DFF$')" -eq 1 ]; then
+  note "case 1: pill set to Running (bolt.fill / #4C8DFF) exactly once"
 else
-  bail "case 1: expected one Running set, log: $(cat "$CALLS")"
+  bail "case 1: expected one styled Running set, log: $(cat "$CALLS")"
+fi
+if [ "$(count '^set-status polytoken Running$')" -eq 0 ]; then
+  note "case 1: no plain fallback fired on the happy path"
+else
+  bail "case 1: unexpected plain Running retry, log: $(cat "$CALLS")"
 fi
 
 # 2. working again -> set again (re-set on every invocation).
 out="$(run_status working 2>/dev/null)"; rc=$?
 assert_handler_contract "$rc" "$out" "case 2: Working set again"
-if [ "$(count '^set-status polytoken Running$')" -eq 2 ]; then
+if [ "$(count '^set-status polytoken Running --icon bolt.fill --color #4C8DFF$')" -eq 2 ]; then
   note "case 2: repeat invocation re-sets Running (no dedup)"
 else
-  bail "case 2: expected two Running sets, log: $(cat "$CALLS")"
+  bail "case 2: expected two styled Running sets, log: $(cat "$CALLS")"
+fi
+if [ "$(count '^set-status polytoken Running$')" -eq 0 ]; then
+  note "case 2: still no plain fallback"
+else
+  bail "case 2: unexpected plain Running retry, log: $(cat "$CALLS")"
 fi
 
 # 3. needs-attention after working.
-args3_before="$(count_args '^3$')"
+args3_before="$(count_args '^7$')"
 out="$(run_status needs-attention 2>/dev/null)"; rc=$?
 assert_handler_contract "$rc" "$out" "case 3: needs-attention"
-if [ "$(count '^set-status polytoken Needs input$')" -eq 1 ]; then
-  note "case 3: pill set to Needs input"
+if [ "$(count '^set-status polytoken Needs input --icon bell.fill --color #FF9500$')" -eq 1 ]; then
+  note "case 3: pill set to Needs input (bell.fill / #FF9500)"
 else
-  bail "case 3: expected a Needs input set, log: $(cat "$CALLS")"
+  bail "case 3: expected a styled Needs input set, log: $(cat "$CALLS")"
 fi
-args3_after="$(count_args '^3$')"
-if [ "$((args3_after - args3_before))" -eq 1 ]; then
-  note "case 3: set-status received exactly 3 argv (quoted multi-word pill)"
+if [ "$(count '^set-status polytoken Needs input$')" -eq 0 ]; then
+  note "case 3: no plain Needs input fallback"
 else
-  bail "case 3: expected one 3-argv set-status call, got $((args3_after - args3_before)) (word-split?)"
+  bail "case 3: unexpected plain Needs input retry, log: $(cat "$CALLS")"
+fi
+args3_after="$(count_args '^7$')"
+if [ "$((args3_after - args3_before))" -eq 1 ]; then
+  note "case 3: set-status received exactly 7 argv (quoted multi-word pill)"
+else
+  bail "case 3: expected one 7-argv set-status call, got $((args3_after - args3_before)) (word-split?)"
 fi
 
 # 4. reset -> clear-status; a following working still fires a new set.
@@ -188,10 +216,10 @@ else
 fi
 out="$(run_status working 2>/dev/null)"; rc=$?
 assert_handler_contract "$rc" "$out" "case 4b: working after reset"
-if [ "$(count '^set-status polytoken Running$')" -eq 3 ]; then
-  note "case 4b: working after reset fires a new Running set"
+if [ "$(count '^set-status polytoken Running --icon bolt.fill --color #4C8DFF$')" -eq 3 ]; then
+  note "case 4b: working after reset fires a new styled Running set"
 else
-  bail "case 4b: expected a fresh Running set, log: $(cat "$CALLS")"
+  bail "case 4b: expected a fresh styled Running set, log: $(cat "$CALLS")"
 fi
 
 # 5. done with an active goal -> no cmux call at all.
@@ -206,19 +234,24 @@ else
 fi
 
 # 6. done with no goal -> Idle pill + notification.
-args3_before="$(count_args '^3$')"
+args3_before="$(count_args '^7$')"
 out="$(run_status done POLYTOKEN_GOAL_ACTIVE=false 2>/dev/null)"; rc=$?
 assert_handler_contract "$rc" "$out" "case 6: done with no goal"
-if [ "$(count '^set-status polytoken Idle$')" -eq 1 ]; then
-  note "case 6: pill set to Idle"
+if [ "$(count '^set-status polytoken Idle --icon pause.circle.fill --color #8E8E93$')" -eq 1 ]; then
+  note "case 6: pill set to Idle (pause.circle.fill / #8E8E93)"
 else
-  bail "case 6: expected an Idle set, log: $(cat "$CALLS")"
+  bail "case 6: expected a styled Idle set, log: $(cat "$CALLS")"
 fi
-args3_after="$(count_args '^3$')"
-if [ "$((args3_after - args3_before))" -eq 1 ]; then
-  note "case 6: set-status received exactly 3 argv"
+if [ "$(count '^set-status polytoken Idle$')" -eq 0 ]; then
+  note "case 6: no plain Idle fallback"
 else
-  bail "case 6: expected one 3-argv set-status call, got $((args3_after - args3_before)) (word-split?)"
+  bail "case 6: unexpected plain Idle retry, log: $(cat "$CALLS")"
+fi
+args3_after="$(count_args '^7$')"
+if [ "$((args3_after - args3_before))" -eq 1 ]; then
+  note "case 6: set-status received exactly 7 argv"
+else
+  bail "case 6: expected one 7-argv set-status call, got $((args3_after - args3_before)) (word-split?)"
 fi
 if [ "$(count '^notify --title Polytoken --body Loop finished')" -eq 1 ]; then
   note "case 6: done posts its notification"
@@ -229,10 +262,10 @@ fi
 # 6b. escape hatch: done while goal active with PTCMUX_SET_DONE_WHEN_GOAL_ACTIVE=1.
 out="$(run_status done POLYTOKEN_GOAL_ACTIVE=true PTCMUX_SET_DONE_WHEN_GOAL_ACTIVE=1 2>/dev/null)"; rc=$?
 assert_handler_contract "$rc" "$out" "case 6b: SET_DONE_WHEN_GOAL_ACTIVE escape hatch"
-if [ "$(count '^set-status polytoken Idle$')" -eq 2 ]; then
-  note "case 6b: Idle set despite the active goal"
+if [ "$(count '^set-status polytoken Idle --icon pause.circle.fill --color #8E8E93$')" -eq 2 ]; then
+  note "case 6b: styled Idle set despite the active goal"
 else
-  bail "case 6b: expected an Idle set, log: $(cat "$CALLS")"
+  bail "case 6b: expected a styled Idle set, log: $(cat "$CALLS")"
 fi
 
 # 7. cmux missing entirely (override dead, no cmux on PATH) -> exit 0, silent.
@@ -256,16 +289,23 @@ if [ -s "$TEST_LOG_DIR/error.log" ]; then
 else
   bail "case 8: expected the failure to be logged"
 fi
+if [ "$(count '^set-status polytoken Running --icon bolt.fill --color #4C8DFF$')" -eq 1 ] \
+   && [ "$(count '^set-status polytoken Running$')" -eq 1 ] \
+   && [ "$(count '^notify --clear$')" -eq 1 ]; then
+  note "case 8: exactly one styled attempt, one plain retry, one notify — all failed, none repeated"
+else
+  bail "case 8: unexpected call counts, log: $(cat "$CALLS")"
+fi
 
 # 9. arbitrary JSON on stdin is ignored.
 setup
 remember_calls
 out="$(printf '{"session_id":"s","tool_input":{"q":"hi"}}' | run_status working 2>/dev/null)"; rc=$?
 assert_handler_contract "$rc" "$out" "case 9: stdin JSON ignored"
-if [ "$(count '^set-status polytoken Running$')" -eq 1 ]; then
-  note "case 9: Running set despite (unrelated) stdin payload"
+if [ "$(count '^set-status polytoken Running --icon bolt.fill --color #4C8DFF$')" -eq 1 ]; then
+  note "case 9: styled Running set despite (unrelated) stdin payload"
 else
-  bail "case 9: expected a Running set, log: $(cat "$CALLS")"
+  bail "case 9: expected a styled Running set, log: $(cat "$CALLS")"
 fi
 
 # ----------------------------------------------------- install cases -----
@@ -399,10 +439,11 @@ fi
 # ---------------------------------------------- notification/watcher -----
 
 # 14. waiting lanes post notifications; working/reset clear them; each
-#     set-status call carries exactly 3 argv (quoted multi-word pills).
+#     styled set-status call carries exactly 7 argv (quoted multi-word
+#     pills) and never falls back to a plain call on the happy path.
 setup
 remember_calls
-args3_before="$(count_args '^3$')"
+args3_before="$(count_args '^7$')"
 run_status needs-attention >/dev/null 2>&1
 run_status review >/dev/null 2>&1
 run_status done POLYTOKEN_GOAL_ACTIVE=false >/dev/null 2>&1
@@ -416,16 +457,35 @@ if [ "$(count '^notify --title Polytoken --body A user question is waiting for y
 else
   bail "case 14: unexpected notify log: $(cat "$CALLS")"
 fi
-if [ "$(count '^set-status polytoken In review$')" -eq 1 ]; then
-  note "case 14: review set the In review pill"
+if [ "$(count '^set-status polytoken Needs input --icon bell.fill --color #FF9500$')" -eq 1 ]; then
+  note "case 14: needs-attention set its styled Needs input pill"
 else
-  bail "case 14: expected one In review set, log: $(cat "$CALLS")"
+  bail "case 14: expected one styled Needs input set, log: $(cat "$CALLS")"
 fi
-args3_after="$(count_args '^3$')"
-if [ "$((args3_after - args3_before))" -eq 4 ]; then
-  note "case 14: all four set-status calls carried exactly 3 argv"
+if [ "$(count '^set-status polytoken In review --icon eye.fill --color #34C759$')" -eq 1 ]; then
+  note "case 14: review set its styled In review pill"
 else
-  bail "case 14: expected four 3-argv set-status calls, got $((args3_after - args3_before)) (word-split?)"
+  bail "case 14: expected one styled In review set, log: $(cat "$CALLS")"
+fi
+if [ "$(count '^set-status polytoken Idle --icon pause.circle.fill --color #8E8E93$')" -eq 1 ] \
+   && [ "$(count '^set-status polytoken Running --icon bolt.fill --color #4C8DFF$')" -eq 1 ]; then
+  note "case 14: done and working set their styled pills"
+else
+  bail "case 14: expected one styled Idle and one styled Running set, log: $(cat "$CALLS")"
+fi
+if [ "$(count '^set-status polytoken Needs input$')" -eq 0 ] \
+   && [ "$(count '^set-status polytoken In review$')" -eq 0 ] \
+   && [ "$(count '^set-status polytoken Idle$')" -eq 0 ] \
+   && [ "$(count '^set-status polytoken Running$')" -eq 0 ]; then
+  note "case 14: no plain fallback on any happy-path lane"
+else
+  bail "case 14: unexpected plain set-status retry, log: $(cat "$CALLS")"
+fi
+args3_after="$(count_args '^7$')"
+if [ "$((args3_after - args3_before))" -eq 4 ]; then
+  note "case 14: all four set-status calls carried exactly 7 argv"
+else
+  bail "case 14: expected four 7-argv set-status calls, got $((args3_after - args3_before)) (word-split?)"
 fi
 
 # 15. PTCMUX_NOTIFY=0 -> no notify calls at all.
@@ -569,6 +629,25 @@ if [ "$(jq '[.[] | select((.name // "") | startswith("cmux-"))] | length' "$hook
   note "case 19: install twice is idempotent (6 cmux-* + third-party preserved)"
 else
   bail "case 19: unexpected double-install result: $(cat "$hooks_json")"
+fi
+
+# 21. styled set-status rejected (shim fails any --icon call) -> exactly
+#     one failed styled attempt and one plain retry; handler stays silent
+#     and exits 0.
+setup
+remember_calls
+out="$(run_status working PTCMUX_TEST_SHIM_FAIL_ICON=1 2>/dev/null)"; rc=$?
+assert_handler_contract "$rc" "$out" "case 21: styled set-status rejected"
+if [ "$(count '^set-status polytoken Running --icon bolt.fill --color #4C8DFF$')" -eq 1 ] \
+   && [ "$(count '^set-status polytoken Running$')" -eq 1 ]; then
+  note "case 21: one styled attempt, one plain fallback retry, pill still set"
+else
+  bail "case 21: expected one styled attempt plus one plain retry, log: $(cat "$CALLS")"
+fi
+if [ -s "$TEST_LOG_DIR/error.log" ]; then
+  note "case 21: fallback failure logged to error.log"
+else
+  bail "case 21: expected the styled failure to be logged"
 fi
 
 # ------------------------------------------------ negative lane check ----

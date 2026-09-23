@@ -7,16 +7,24 @@ is waiting on you.
 ## What it does
 
 Whenever a Polytoken session runs inside a cmux workspace, the session's
-sidebar row shows a status pill — the same text-pill treatment native
-Claude Code sessions get — under the status key `polytoken`:
+sidebar row shows a status pill — the same icon-and-color pill treatment
+native Claude Code sessions get — under the status key `polytoken`:
 
-| Pill text | cmux call | Polytoken hook event | Why |
-|---|---|---|---|
-| `Running` | `cmux set-status polytoken Running` | `pre_user_prompt`, `pre_model_turn` | A submitted prompt or an upcoming model call means the loop is running. |
-| `Needs input` | `cmux set-status polytoken "Needs input"` | `pre_tool_use` (`ask_user_question`) | Fires right before a user question blocks the turn. |
-| `In review` | `cmux set-status polytoken "In review"` | `pre_tool_use` (`handoff_plan`) | Fires right before a plan is submitted for operator review. |
-| `Idle` | `cmux set-status polytoken Idle` | `stop` | The model finished and the turn went back to the user. |
-| — (pill removed) | `cmux clear-status polytoken` | `session_start` (reset) | Clears any stale pill from a previous session. |
+| Pill text | Icon | Color | cmux call | Polytoken hook event | Why |
+|---|---|---|---|---|---|
+| `Running` | `bolt.fill` | `#4C8DFF` | `cmux set-status polytoken Running --icon bolt.fill --color '#4C8DFF'` | `pre_user_prompt`, `pre_model_turn` | A submitted prompt or an upcoming model call means the loop is running. |
+| `Needs input` | `bell.fill` | `#FF9500` | `cmux set-status polytoken 'Needs input' --icon bell.fill --color '#FF9500'` | `pre_tool_use` (`ask_user_question`) | Fires right before a user question blocks the turn. |
+| `In review` | `eye.fill` | `#34C759` | `cmux set-status polytoken 'In review' --icon eye.fill --color '#34C759'` | `pre_tool_use` (`handoff_plan`) | Fires right before a plan is submitted for operator review. |
+| `Idle` | `pause.circle.fill` | `#8E8E93` | `cmux set-status polytoken Idle --icon pause.circle.fill --color '#8E8E93'` | `stop` | The model finished and the turn went back to the user. |
+| — (pill removed) | — | — | `cmux clear-status polytoken` | `session_start` (reset) | Clears any stale pill from a previous session. |
+
+The `Running` icon/color pair is exactly what cmux itself sends for its
+built-in Claude Code integration. The other three are deliberate choices:
+`Needs input` uses amber instead of cmux's blue so the two states are
+visually distinct (the identical-blue native treatment is a known
+complaint, cmux #2616); `In review` and `Idle` have no native equivalent
+under the custom `polytoken` key (the `Idle` icon matches what cmux uses
+for Codex).
 
 Additionally:
 
@@ -35,10 +43,13 @@ Additionally:
   loop keeps running on your behalf after every `stop`, so `stop` does
   **not** set `Idle` — the pill stays `Running` until the goal finishes
   and the final turn ends without a goal active.
-- **Plain text pill.** Agent keys (e.g. `claude_code`) may get an agent
-  icon rendered next to the pill; the custom `polytoken` key renders as a
-  plain text pill. `cmux set-status` accepts `--icon`/`--color` if
-  styling is ever wanted.
+- **Styled pill.** Each lane's `cmux set-status` call passes `--icon`
+  (an SF Symbols name) and `--color` (a hex string) via the documented
+  `cmux set-status` styling flags, mirroring the values cmux itself
+  uses for its built-in Claude Code integration (see the table above).
+  On a cmux build that rejects the styling flags the handler logs the
+  failure and retries once with the plain unstyled call, so the pill is
+  always set.
 
 ## Requirements
 
@@ -95,11 +106,13 @@ Start a new Polytoken session in a cmux workspace. After each step check
 and look at the session's sidebar row, which should show the same pill
 treatment native Claude Code sessions show:
 
-1. **Prompt submitted** → pill shows `Running`. Also check mid-turn
-   during a long-running tool call — `pre_model_turn` keeps it set.
+1. **Prompt submitted** → pill shows `Running` with the blue `bolt.fill`
+   icon. Also check mid-turn during a long-running tool call —
+   `pre_model_turn` keeps it set.
 2. **User question open** (the model calls `ask_user_question`) → pill
-   shows `Needs input` while the question is on screen; after answering,
-   the next model turn returns it to `Running`.
+   shows `Needs input` with the amber `bell.fill` icon while the
+   question is on screen; after answering, the next model turn returns
+   it to `Running`.
 3. **Plan review open** (the model calls `handoff_plan`) → pill shows
    `In review`; approving or rejecting returns it to `Running` via the
    next model turn.
@@ -182,6 +195,14 @@ Any project can disable individual hooks via a project-level
 
 ## Design notes
 
+- **Why no spinner.** The animated sidebar spinner is gated behind the
+  `sidebar-workspace-agent-spinner-experiment` PostHog flag, which
+  defaults **off** as of cmux 0.64.x — an in-session experiment
+  confirmed `cmux workspace loading on --id polytoken-exp` toggles the
+  loader but nothing renders in the sidebar while the flag is off. The
+  Claude-style animated tab-title `◐` is composited inside cmux for
+  Claude lanes only. Both surfaces are unreachable for a third-party
+  status key, so this repo pins only the static pill icon/color.
 - **Only blocking events are used.** Fire-and-forget events
   (`post_tool_use`, `post_model_turn`) can complete after a later `stop`
   handler's cmux call and land the pill on the wrong state. Blocking

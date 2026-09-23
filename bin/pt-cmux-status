@@ -6,22 +6,30 @@
 #   lane: working | needs-attention | review | done | reset
 #
 # The lane argument maps to cmux's sidebar status pill surface (the same
-# text-pill treatment native Claude Code sessions get), keyed `polytoken`:
+# icon-and-color pill treatment native Claude Code sessions get), keyed
+# `polytoken`. Icons are SF Symbols names and colors are hex strings,
+# each passed as ONE argv word:
 #
-#   lane             cmux call
-#   ---------------  ---------------------------------------------
-#   working          cmux set-status polytoken Running
-#   needs-attention  cmux set-status polytoken "Needs input"
-#   review           cmux set-status polytoken "In review"
-#   done             cmux set-status polytoken Idle
+#   lane             cmux call (styled; fallback drops the flags)
+#   ---------------  -------------------------------------------------------
+#   working          cmux set-status polytoken Running \
+#                       --icon bolt.fill --color '#4C8DFF'
+#   needs-attention  cmux set-status polytoken 'Needs input' \
+#                       --icon bell.fill --color '#FF9500'
+#   review           cmux set-status polytoken 'In review' \
+#                       --icon eye.fill --color '#34C759'
+#   done             cmux set-status polytoken Idle \
+#                       --icon pause.circle.fill --color '#8E8E93'
 #   reset            cmux clear-status polytoken
 #
 # Multi-word pill texts are always ONE argv word (quoted in the table for
 # clarity); an unquoted multi-word literal would send cmux a stray
-# positional argument and the call would fail. Workspace status lanes
-# (`cmux workspace status ...`) are never touched: lanes are the user's
-# manual surface, and the sidebar status pill is the supported agent
-# surface.
+# positional argument and the call would fail. If cmux rejects the styled
+# call (an older build without --icon/--color), the failure is logged and
+# one plain unstyled retry is made, so the pill is always set.
+# Workspace status lanes (`cmux workspace status ...`) are never touched:
+# lanes are the user's manual surface, and the sidebar status pill is the
+# supported agent surface.
 #
 # Contract — this script is a BLOCKING hook handler:
 #   * It ALWAYS exits 0. A nonzero exit could deny a tool call or
@@ -89,10 +97,19 @@ notify_enabled() {
 }
 
 run_cmux() {
-  # run_cmux <args...>: invoke cmux, swallow stdout, log failures.
-  if ! "$CMUX" "$@" >/dev/null 2>>"$LOG_FILE"; then
+  # run_cmux <args...>: invoke cmux, swallow stdout, log failures, and
+  # return cmux's exit status. Most call sites ignore the return value
+  # (the always-exit-0 handler contract is unaffected); the styled
+  # set-status site uses it to detect rejection of styling flags.
+  # rc must be captured IMMEDIATELY after the invocation — after `fi`
+  # it would read the exit status of the `if` compound, which is 0 when
+  # no branch ran, and a failed cmux would look like a success.
+  "$CMUX" "$@" >/dev/null 2>>"$LOG_FILE"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
     log_error "cmux $* failed"
   fi
+  return "$rc"
 }
 
 maybe_spawn_watcher() {
@@ -189,12 +206,16 @@ fi
 # Resolve the pill text to ONE argv word, even when it contains a space.
 # An unquoted multi-word literal would parse as key=polytoken, value=Needs,
 # plus an unknown positional `input` — a usage error, swallowed to the log,
-# and the pill would never set.
+# and the pill would never set. Icon and color mirror what cmux itself
+# sends for its built-in Claude Code integration (bolt.fill on cmux blue
+# while running, bell.fill when input is needed); the needs-attention
+# color is amber rather than cmux's blue so the two states are visually
+# distinct (a known complaint about the native treatment, cmux #2616).
 case "$LANE" in
-  working)         pill=Running ;;
-  needs-attention) pill='Needs input' ;;
-  review)          pill='In review' ;;
-  done)            pill=Idle ;;
+  working)         pill=Running;      icon=bolt.fill;         color='#4C8DFF' ;;
+  needs-attention) pill='Needs input'; icon=bell.fill;         color='#FF9500' ;;
+  review)          pill='In review';   icon=eye.fill;         color='#34C759' ;;
+  done)            pill=Idle;         icon=pause.circle.fill; color='#8E8E93' ;;
   *)
     # Unreachable today (the lane validity check above gates it), but a
     # future lane added to that list without a text here would otherwise
@@ -203,7 +224,15 @@ case "$LANE" in
     exit 0 ;;
 esac
 
-run_cmux set-status polytoken "$pill"
+# Styled call first; on rejection (older cmux without --icon/--color) log
+# it and retry exactly once with the plain call, so the pill is always
+# set and this handler still exits 0 with empty stdout.
+if run_cmux set-status polytoken "$pill" --icon "$icon" --color "$color"; then
+  :
+else
+  log_error "styled set-status failed, falling back to plain (cmux may predate --icon/--color)"
+  run_cmux set-status polytoken "$pill"
+fi
 
 if notify_enabled; then
   case "$LANE" in
