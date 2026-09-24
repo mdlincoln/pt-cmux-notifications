@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 # pt-cmux-watcher — detached helper spawned by pt-cmux-status at session
 # start. Polls the given PIDs until every one has exited, then clears the
-# cmux sidebar status pill for Polytoken (Polytoken hooks have no
-# session-exit event, so this is how the pill is removed on exit).
+# cmux sidebar status pill for Polytoken *and* clears any pending cmux
+# notification (e.g. the final "Loop finished — turn handed back to you"),
+# so nothing this session posted outlives it. Polytoken hooks have no
+# session-exit event, so this is how both surfaces are removed on exit.
 #
 # Usage: pt-cmux-watcher <pid> [<pid> ...]
 #
-# The watcher is intentionally dumb: it owns no state, makes exactly one
-# cmux call at the end of its life, and can be killed at any time without
-# leaving anything behind (worst case: a stale pill, which the next
-# session's reset clears).
+# The watcher is intentionally dumb: it owns no state, makes at most two
+# cmux calls at the end of its life (clear-status, then notify --clear),
+# and can be killed at any time without leaving anything behind (worst
+# case: a stale pill or notification, which the next session's reset or
+# the next Running transition clears).
 #
 # Contract: ALWAYS exits 0 and NEVER writes to stdout.
 #
@@ -76,6 +79,17 @@ done
 if CMUX="$(resolve_cmux)"; then
   if ! "$CMUX" clear-status polytoken >/dev/null 2>>"$LOG_FILE"; then
     log_error "cmux clear-status polytoken failed"
+  fi
+  # Also clear any pending notification (e.g. the final "Loop finished —
+  # turn handed back to you"), which would otherwise persist in the cmux
+  # tab after the session is gone. Only when notifications were enabled —
+  # with PTCMUX_NOTIFY=0 this session never posted one, and because
+  # notify --clear wipes the whole workspace, calling it anyway would
+  # needlessly drop third-party notifications.
+  if [ "${PTCMUX_NOTIFY:-1}" != "0" ]; then
+    if ! "$CMUX" notify --clear >/dev/null 2>>"$LOG_FILE"; then
+      log_error "cmux notify --clear failed"
+    fi
   fi
 else
   log_error "cmux binary not found"
