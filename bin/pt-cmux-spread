@@ -1,0 +1,513 @@
+#!/usr/bin/env bash
+# pt-cmux-spread — arrangement command: leave the Polytoken tab where it is
+# and move the live lazygit/croft tabs into one new split at its right.
+#
+# Usage: pt-cmux-spread [--workspace <id|ref|index>] [-n|--dry-run] [--debug]
+#
+# What it does, in order:
+#   1. Resolve the workspace: --workspace wins, else $CMUX_WORKSPACE_ID, else
+#      the workspace `cmux identify` reports as focused.
+#   2. Read `cmux tree --json` for that workspace and classify every terminal
+#      surface by the processes running on its tty (`ps -t <tty>`):
+#        polytoken         -> keep   (never moved)
+#        lazygit, croft    -> move
+#        anything else     -> untouched (browser/simulator surfaces too)
+#      A tty running both polytoken and a move-tool counts as keep: a tab
+#      hosting a Polytoken session is never moved.
+#   3. Move every move-surface that is not already in the keep pane into it
+#      (keep pane = pane of the first polytoken surface). This is what makes
+#      a re-run converge: the split a previous run created loses its last
+#      surface, and cmux closes an emptied pane, so splits never accumulate.
+#   4. `cmux split-off --surface <first move-surface> right`, then poll the
+#      tree until the split shows up (cmux commits asynchronously — a fast
+#      caller can read the tree before the split exists in it, which is
+#      exactly what a Command Palette run does) and move the remaining
+#      move-surfaces into that pane.
+#
+# Tab order in the new pane is lazygit first, then croft, preserving each
+# tool's existing tab order. Polytoken tabs in *other* panes are deliberately
+# left alone (see README): spread arranges around the first keep pane.
+#
+# Exit codes:
+#   0  arranged, or nothing to do
+#   1  refused or failed. The guard paths ("no polytoken session", no cmux,
+#      no jq, unresolvable workspace) make no mutating call at all. A failure
+#      part-way through leaves a part-arranged workspace; re-running
+#      converges, which is what the pre-collapse in step 3 is for.
+#
+# Dry run (-n) prints the planned cmux calls to stdout and changes nothing.
+# split-off assigns the new pane ref at run time, so the follow-up moves are
+# printed with a placeholder for it. Inspecting the tree is unavoidable to
+# plan anything, so dry run is read-only rather than call-free.
+#
+# --close-when-done closes the terminal this command ran in, but only once it
+# has succeeded: the Command Palette entry passes it so a palette run leaves
+# no tab behind, and a refusal or error deliberately leaves the terminal open
+# so the message can be read. It refuses to close the terminal when that
+# terminal is hosting a Polytoken session, and when CMUX_SURFACE_ID is unset
+# (the surface to close would otherwise be whichever one is *focused*).
+#
+# Environment:
+#   PTCMUX_CMUX_BIN    explicit cmux binary (authoritative: set but not
+#                      executable means "cmux absent", never a PATH lookup)
+#   PTCMUX_PS_BIN      explicit ps binary (same authoritative semantics)
+#   PTCMUX_OWN_TTY     override the tty lookup used by --close-when-done
+#   CMUX_WORKSPACE_ID  workspace used when --workspace is absent
+#   CMUX_SURFACE_ID    the terminal running this command (set by cmux; used
+#                      by --close-when-done)
+#
+# Requires jq (this repo already needs it for install.sh/uninstall.sh).
+#
+# Surfaces are addressed by absolute ref (surface:N / pane:N), so no cmux
+# call here passes --workspace: for move-surface that flag means *target
+# workspace*, and the workspace context of a full ref is unambiguous.
+#
+# Deliberately no `set -e`: every failure is handled explicitly so a failed
+# step can be reported instead of silently ending the script, and this stays
+# compatible with bash 3.2 (macOS).
+
+set -u
+
+PROG=pt-cmux-spread
+
+usage() {
+  cat <<'EOF'
+usage: pt-cmux-spread [--workspace <id|ref|index>] [-n|--dry-run] [--debug]
+
+Keeps every Polytoken tab where it is and moves the tabs whose tty runs
+lazygit or croft into a single new split immediately to the right of the
+Polytoken pane.
+
+  --workspace <id|ref|index>  workspace to arrange (default: $CMUX_WORKSPACE_ID,
+                              else the workspace `cmux identify` reports)
+  -n, --dry-run               print the planned cmux calls, change nothing
+  --close-when-done           close the terminal this command is running in
+                              once it succeeds — the Command Palette entry
+                              passes this so a palette run leaves no tab
+                              behind. On a refusal or error the terminal is
+                              left open so the message can be read.
+  --debug                     dump the per-surface classification to stderr
+  -h, --help                  this text
+EOF
+}
+
+err() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+
+WS=""
+DRY_RUN=0
+DEBUG=0
+CLOSE_WHEN_DONE=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --workspace)
+      if [ $# -lt 2 ]; then
+        err "--workspace needs a value"
+        exit 1
+      fi
+      WS="$2"; shift 2 ;;
+    --workspace=*) WS="${1#--workspace=}"; shift ;;
+    -n|--dry-run) DRY_RUN=1; shift ;;
+    --close-when-done) CLOSE_WHEN_DONE=1; shift ;;
+    --debug) DEBUG=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) err "unknown argument: $1"; usage >&2; exit 1 ;;
+  esac
+done
+
+# ------------------------------------------------------------ binaries ----
+
+resolve_jq() {
+  found="$(command -v jq 2>/dev/null)"
+  if [ -n "$found" ]; then
+    printf '%s\n' "$found"
+    return 0
+  fi
+  if [ -x /opt/homebrew/bin/jq ]; then
+    printf '%s\n' /opt/homebrew/bin/jq
+    return 0
+  fi
+  return 1
+}
+
+resolve_cmux() {
+  # Print the path of the cmux binary, or return 1 if none is usable.
+  # An explicit override is authoritative, so tests and users never hit an
+  # installed cmux by accident.
+  if [ -n "${PTCMUX_CMUX_BIN:-}" ]; then
+    if [ -x "$PTCMUX_CMUX_BIN" ]; then
+      printf '%s\n' "$PTCMUX_CMUX_BIN"
+      return 0
+    fi
+    return 1
+  fi
+  found="$(command -v cmux 2>/dev/null)"
+  if [ -n "$found" ]; then
+    printf '%s\n' "$found"
+    return 0
+  fi
+  if [ -x /Applications/cmux.app/Contents/Resources/bin/cmux ]; then
+    printf '%s\n' /Applications/cmux.app/Contents/Resources/bin/cmux
+    return 0
+  fi
+  return 1
+}
+
+resolve_ps() {
+  if [ -n "${PTCMUX_PS_BIN:-}" ]; then
+    if [ -x "$PTCMUX_PS_BIN" ]; then
+      printf '%s\n' "$PTCMUX_PS_BIN"
+      return 0
+    fi
+    return 1
+  fi
+  found="$(command -v ps 2>/dev/null)"
+  if [ -n "$found" ]; then
+    printf '%s\n' "$found"
+    return 0
+  fi
+  if [ -x /bin/ps ]; then
+    printf '%s\n' /bin/ps
+    return 0
+  fi
+  return 1
+}
+
+JQ="$(resolve_jq)" || { err "jq not found; install jq (brew install jq)"; exit 1; }
+CMUX="$(resolve_cmux)" || { err "cmux binary not found (set PTCMUX_CMUX_BIN or install cmux)"; exit 1; }
+PS_BIN="$(resolve_ps)" || { err "ps binary not found (set PTCMUX_PS_BIN)"; exit 1; }
+
+# -------------------------------------------------- workspace resolution ---
+
+if [ -z "$WS" ]; then
+  WS="${CMUX_WORKSPACE_ID:-}"
+fi
+if [ -z "$WS" ]; then
+  # Covers a caller with no cmux terminal context of its own (the Command
+  # Palette may run an action with no surface to derive it from).
+  WS="$("$CMUX" identify --json 2>/dev/null | "$JQ" -r '(.focused.workspace_ref // empty)' 2>/dev/null || true)"
+fi
+if [ -z "$WS" ]; then
+  err "could not resolve a workspace; pass --workspace <id|ref|index>"
+  exit 1
+fi
+
+# ------------------------------------------------------------ cmux I/O ----
+
+cmux_call() {
+  # Run a cmux call. In dry-run mode the call is printed to stdout instead
+  # of being made, so the plan is visible and reusable. In live mode the
+  # call is echoed to stderr as progress.
+  if [ "$DRY_RUN" = "1" ]; then
+    printf 'cmux %s\n' "$*"
+    return 0
+  fi
+  err "cmux $*"
+  if ! "$CMUX" "$@" >/dev/null 2>&1; then
+    err "cmux $* failed"
+    return 1
+  fi
+  return 0
+}
+
+tree_json() {
+  # cmux's own error text is left on stderr: "workspace not found" and "no
+  # cmux running" print different things there, and that is the quickest way
+  # to tell them apart.
+  "$CMUX" tree --json --workspace "$WS"
+}
+
+tree_records() {
+  # tree_records <tree-json>: TSV rows of pane_ref, surface_ref, tty, type.
+  # The workspace is matched by ref, id, or index — the three forms
+  # `cmux --workspace` accepts itself — because `--workspace 3` must not fall
+  # through to "no Polytoken session" just because the tree reports the
+  # canonical "workspace:3". jq's stderr is passed through on purpose: a tree
+  # this parser cannot read should say so instead of looking like an empty
+  # workspace.
+  #
+  # Absent values are emitted as "-" rather than as empty fields: tab is
+  # IFS-whitespace, so an empty middle field collapses and shifts every field
+  # after it (a browser surface with no tty would otherwise report its type
+  # as its tty).
+  printf '%s' "$1" | "$JQ" -r --arg ws "$WS" '
+    .windows[].workspaces[]
+    | select((.ref == $ws) or (.id == $ws) or ((.index | tostring) == $ws))
+    | (.panes // [])[]
+    | . as $p
+    | ($p.surfaces // [])[]
+    | [ $p.ref, (.ref // "-"), (.tty // "-"), (.type // "-") ]
+    | @tsv
+  '
+}
+
+tree_pane_of_surface() {
+  # tree_pane_of_surface <tree-json> <surface-ref>: the pane holding that
+  # surface, or nothing. Pane membership comes from the tree rather than
+  # split-off's stdout, whose formatting is not a contract.
+  printf '%s' "$1" | "$JQ" -r --arg ws "$WS" --arg s "$2" '
+    [ .windows[].workspaces[]
+      | select((.ref == $ws) or (.id == $ws) or ((.index | tostring) == $ws))
+      | (.panes // [])[]
+      | select(((.surfaces // []) | map(.ref // "") | index($s)) != null)
+      | .ref
+    ] | .[0] // empty
+  '
+}
+
+# ------------------------------------------------------------- cleanup ----
+
+own_tty() {
+  # own_tty: the tty of the terminal this command is running in, or nothing
+  # when it has none (run detached, from a non-terminal, or from a context
+  # without a controlling tty). PTCMUX_OWN_TTY is authoritative when set —
+  # including when it is set to empty, which means "no tty here" (the same
+  # set-but-unusable convention as PTCMUX_CMUX_BIN).
+  if [ -n "${PTCMUX_OWN_TTY+set}" ]; then
+    printf '%s\n' "${PTCMUX_OWN_TTY#/dev/}"
+    return 0
+  fi
+  value="$(tty 2>/dev/null)" || value=""
+  case "$value" in
+    ''|'not a tty') return 0 ;;
+  esac
+  printf '%s\n' "${value#/dev/}"
+}
+
+close_own_surface() {
+  # Close the terminal this command is running in. The Command Palette entry
+  # passes --close-when-done so that triggering the action there leaves no tab
+  # behind; cmux exports CMUX_SURFACE_ID into the shells it starts, which is
+  # what identifies that terminal.
+  #
+  # Only ever reached on the success path, and every refusal below leaves the
+  # terminal open on purpose so the message is readable. `cmux close-surface`
+  # with no --surface would close whatever is *focused*, which is why an unset
+  # CMUX_SURFACE_ID is a refusal rather than a bare call.
+  if [ -z "${CMUX_SURFACE_ID:-}" ]; then
+    err "--close-when-done: CMUX_SURFACE_ID is unset, so this terminal cannot be identified; leaving it open"
+    return 0
+  fi
+  # Close only when this terminal has been positively identified *and* is not
+  # the one hosting the session. With no tty of our own (detached, or a caller
+  # with no controlling terminal) there is nothing to compare against, and
+  # "leave the tab alone" is always the safe answer.
+  own_tty_name="$(own_tty)"
+  if [ -z "$own_tty_name" ]; then
+    err "--close-when-done: cannot identify the terminal this is running in; leaving it open"
+    return 0
+  fi
+  if [ "$(classify_tty "$own_tty_name")" = "keep" ]; then
+    err "--close-when-done: refusing to close the terminal hosting the Polytoken session"
+    return 0
+  fi
+  if [ "$DRY_RUN" = "1" ]; then
+    printf 'cmux close-surface --surface %s\n' "$CMUX_SURFACE_ID"
+    return 0
+  fi
+  if ! "$CMUX" close-surface --surface "$CMUX_SURFACE_ID" >/dev/null 2>&1; then
+    err "--close-when-done: could not close this terminal ($CMUX_SURFACE_ID)"
+  fi
+  return 0
+}
+
+finish() {
+  # finish <exit-code>: on success, honour --close-when-done; then exit.
+  # Errors exit without closing, so a failed run keeps its message on screen.
+  code="$1"
+  if [ "$code" -eq 0 ] && [ "$CLOSE_WHEN_DONE" = "1" ]; then
+    close_own_surface
+  fi
+  exit "$code"
+}
+
+# -------------------------------------------------------- classification ---
+
+classify_tty() {
+  # classify_tty <tty>: print keep | lazygit | croft | other.
+  # keep wins over a move-tool, so a tab hosting a Polytoken session is never
+  # moved even if the same tty also runs lazygit/croft. A ps failure or an
+  # empty tty classifies as other, i.e. untouched: harmless.
+  tty="$1"
+  # macOS `ps -t` wants a bare tty name: /dev/ttys012 fails where ttys012
+  # works, and a ps failure would classify every surface as "other" — which
+  # looks exactly like "no Polytoken session here", so strip any prefix.
+  tty="${tty#/dev/}"
+  # A ps failure or an empty tty classifies as other, i.e. untouched:
+  # harmless.
+  [ -n "$tty" ] || { printf 'other\n'; return 0; }
+  comms="$("$PS_BIN" -t "$tty" -o pid=,comm= 2>/dev/null || true)"
+  keep=0; lg=0; cr=0
+  while read -r _pid cname; do
+    [ -n "$cname" ] || continue
+    # comm is an executable path (and a login shell shows up as "-/bin/zsh"),
+    # so compare the basename with any leading dash stripped.
+    base="${cname##*/}"
+    base="${base#-}"
+    base="$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]')"
+    case "$base" in
+      polytoken) keep=1 ;;
+      lazygit)   lg=1 ;;
+      croft)     cr=1 ;;
+    esac
+  done <<<"$comms"
+  if [ "$keep" = "1" ]; then
+    printf 'keep\n'
+  elif [ "$lg" = "1" ]; then
+    printf 'lazygit\n'
+  elif [ "$cr" = "1" ]; then
+    printf 'croft\n'
+  else
+    printf 'other\n'
+  fi
+}
+
+# ----------------------------------------------------------- inspection ---
+
+TREE="$(tree_json || true)"
+if [ -z "$TREE" ]; then
+  err "could not read the cmux tree for workspace ${WS:-<unresolved>} (cmux rejected that workspace, or is not running)"
+  exit 1
+fi
+
+# Distinguish "that workspace is not here" from "no Polytoken session in it":
+# the two have completely different fixes, and collapsing them into one
+# message sends the user looking in the wrong place.
+ws_present="$(printf '%s' "$TREE" | "$JQ" -r --arg ws "$WS" '
+  [ .windows[].workspaces[]
+    | select((.ref == $ws) or (.id == $ws) or ((.index | tostring) == $ws)) ] | length
+')" || ws_present=""
+case "$ws_present" in
+  ''|*[!0-9]*)
+    err "could not read the workspace list out of cmux's tree"
+    exit 1 ;;
+esac
+if [ "$ws_present" -eq 0 ]; then
+  err "workspace $WS is not in cmux's tree; --workspace takes a ref (workspace:3), an id, or an index"
+  exit 1
+fi
+
+records="$(tree_records "$TREE")" || records=""
+
+keep_count=0
+keep_pane=""
+MOVE_LG=""
+MOVE_CROFT=""
+
+while IFS="$(printf '\t')" read -r p_ref s_ref s_tty s_type; do
+  # "-" is the placeholder tree_records uses for an absent value; a surface
+  # with no ref at all is skipped rather than addressed.
+  case "$s_ref" in ""|-*) continue ;; esac
+  [ "$s_tty" = "-" ] && s_tty=""
+  [ "$s_type" = "-" ] && s_type=""
+  if [ "$s_type" != "terminal" ]; then
+    [ "$DEBUG" = "1" ] && err "debug: $s_ref pane=$p_ref type=$s_type -> untouched (not a terminal)"
+    continue
+  fi
+  cls="$(classify_tty "$s_tty")"
+  [ "$DEBUG" = "1" ] && err "debug: $s_ref pane=$p_ref tty=${s_tty:-none} -> $cls"
+  case "$cls" in
+    keep)
+      keep_count=$((keep_count + 1))
+      # keep_pane doubles as the "have I seen a keep surface yet" flag: the
+      # keep pane is the pane of the *first* Polytoken surface in tree order.
+      if [ -z "$keep_pane" ]; then
+        keep_pane="$p_ref"
+      fi
+      ;;
+    lazygit) MOVE_LG="$MOVE_LG$s_ref $p_ref"$'\n' ;;
+    croft)   MOVE_CROFT="$MOVE_CROFT$s_ref $p_ref"$'\n' ;;
+    *) ;;
+  esac
+done <<<"$records"
+
+lg_count="$(printf '%s' "$MOVE_LG" | grep -c . || true)"
+croft_count="$(printf '%s' "$MOVE_CROFT" | grep -c . || true)"
+move_total=$((lg_count + croft_count))
+# lazygit before croft always; within one tool, tree order.
+MOVE_ORDERED="$MOVE_LG$MOVE_CROFT"
+
+# ---------------------------------------------------------------- guards ---
+
+if [ "$keep_count" -eq 0 ]; then
+  err "no polytoken session in ${WS:-this workspace}; nothing to arrange"
+  exit 1
+fi
+
+if [ "$move_total" -eq 0 ]; then
+  printf '%s: nothing to spread in %s (no tab is running lazygit or croft)\n' "$PROG" "$WS"
+  finish 0
+fi
+
+first_line="$(printf '%s' "$MOVE_ORDERED" | head -n 1)"
+first_move="${first_line%% *}"
+
+# -------------------------------------------------------------- collapse ---
+
+# Bring every move-surface into the keep pane first. On a fresh workspace
+# this is usually a no-op; on an already-spread workspace it empties the
+# previous split (cmux closes the pane), so the split-off below rebuilds the
+# same layout instead of adding a second one.
+while IFS= read -r line; do
+  [ -n "$line" ] || continue
+  ref="${line%% *}"
+  pane="${line##* }"
+  [ "$pane" = "$keep_pane" ] && continue
+  cmux_call move-surface --surface "$ref" --pane "$keep_pane" --focus false || exit 1
+done <<<"$MOVE_ORDERED"
+
+# ---------------------------------------------------------------- spread ---
+
+cmux_call split-off --surface "$first_move" right --focus false || exit 1
+
+if [ "$DRY_RUN" = "1" ]; then
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    ref="${line%% *}"
+    [ "$ref" = "$first_move" ] && continue
+    cmux_call move-surface --surface "$ref" --pane '<new pane from the split>' --focus false
+  done <<<"$MOVE_ORDERED"
+  err "dry run: nothing changed; $move_total tab(s) would move"
+  finish 0
+fi
+
+# split-off reports success before the tree reflects the new split: cmux
+# commits the mutation asynchronously (measured live on 0.64.x — tree reads
+# lag the CLI's return by ~0.1-0.3 s). A single re-read therefore races that
+# commit, and a fast caller reliably loses: the Command Palette's action
+# shell read the stale tree on every attempt, concluded the split never
+# happened, exited 1, and left its tab open. Poll for the post-condition
+# with a deadline instead — the common case settles on the first or second
+# read.
+deadline=$(( $(date +%s) + 5 ))
+new_pane=""
+while :; do
+  TREE2="$(tree_json || true)"
+  if [ -n "$TREE2" ]; then
+    new_pane="$(tree_pane_of_surface "$TREE2" "$first_move")"
+    if [ -n "$new_pane" ] && [ "$new_pane" != "$keep_pane" ]; then
+      break
+    fi
+  fi
+  [ "$(date +%s)" -ge "$deadline" ] && break
+  sleep 0.05
+done
+if [ -z "$new_pane" ]; then
+  err "could not find the pane that now holds $first_move"
+  exit 1
+fi
+if [ "$new_pane" = "$keep_pane" ]; then
+  err "split-off did not create a new pane ($first_move is still in $keep_pane)"
+  exit 1
+fi
+
+while IFS= read -r line; do
+  [ -n "$line" ] || continue
+  ref="${line%% *}"
+  [ "$ref" = "$first_move" ] && continue
+  cmux_call move-surface --surface "$ref" --pane "$new_pane" --focus false || exit 1
+done <<<"$MOVE_ORDERED"
+
+printf '%s: kept %s polytoken tab(s) in %s; moved %s tab(s) into %s\n' \
+  "$PROG" "$keep_count" "$keep_pane" "$move_total" "$new_pane"
+finish 0

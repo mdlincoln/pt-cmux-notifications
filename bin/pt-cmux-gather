@@ -1,0 +1,480 @@
+#!/usr/bin/env bash
+# pt-cmux-gather — arrangement command: collapse every pane of a workspace
+# so that all of its surfaces live as tabs in a single pane.
+#
+# Usage: pt-cmux-gather [--workspace <id|ref|index>] [-n|--dry-run] [--debug]
+#
+# What it does, in order:
+#   1. Resolve the workspace: --workspace wins, else $CMUX_WORKSPACE_ID, else
+#      the workspace `cmux identify` reports as focused.
+#   2. Read `cmux tree --json` and group the surfaces by pane.
+#   3. Pick the target pane: the focused pane, else the first pane.
+#   4. Move every surface of every *other* pane into the target pane, each
+#      one placed `--after` the surface moved before it (starting after the
+#      target pane's own last surface), so tab order is preserved: the
+#      target pane's tabs first in their existing order, then the other
+#      panes' tabs in tree order, each pane keeping its own tab order.
+#   5. Re-read the tree — polling, since cmux commits its mutations
+#      asynchronously — and report any pane that still exists. cmux closes a
+#      pane when its last surface leaves it (there is no close-pane command),
+#      so a leftover pane means that assumption did not hold here.
+#
+# A single-pane workspace is a no-op: nothing is called, not even a re-read.
+#
+# Exit codes:
+#   0  gathered (or already gathered). Leftover panes are reported as a
+#      warning and still exit 0 — the surfaces did all move.
+#   1  refused or failed (no cmux, no jq, unresolvable workspace, or a
+#      mutating call failed). Re-running converges.
+#
+# Dry run (-n) prints the planned cmux calls to stdout and changes nothing.
+# Reading the tree is unavoidable to plan anything, so dry run is read-only
+# rather than call-free. No re-read happens in dry run (there is nothing to
+# verify).
+#
+# --close-when-done closes the terminal this command ran in, but only once it
+# has succeeded: the Command Palette entry passes it so a palette run leaves
+# no tab behind, and a refusal or error deliberately leaves the terminal open
+# so the message can be read. It refuses to close the terminal when that
+# terminal is hosting a Polytoken session, and when CMUX_SURFACE_ID is unset
+# (the surface to close would otherwise be whichever one is *focused*).
+#
+# Environment:
+#   PTCMUX_CMUX_BIN    explicit cmux binary (authoritative: set but not
+#                      executable means "cmux absent", never a PATH lookup)
+#   PTCMUX_PS_BIN      optional ps override, consulted only by
+#                      --close-when-done's safety check
+#   PTCMUX_OWN_TTY     override the tty lookup used by --close-when-done
+#   CMUX_WORKSPACE_ID  workspace used when --workspace is absent
+#   CMUX_SURFACE_ID    the terminal running this command (set by cmux; used
+#                      by --close-when-done)
+#
+# Requires jq (this repo already needs it for install.sh/uninstall.sh).
+#
+# Surfaces and panes are addressed by absolute ref (surface:N / pane:N), so
+# no cmux call here passes --workspace: for move-surface that flag means
+# *target workspace*, and the workspace context of a full ref is
+# unambiguous. cmux's own errors go to stderr with a nonzero exit, which is
+# what the checks below surface.
+#
+# Deliberately no `set -e`: every failure is handled explicitly so a failed
+# step can be reported instead of silently ending the script, and this stays
+# compatible with bash 3.2 (macOS).
+
+set -u
+
+PROG=pt-cmux-gather
+TAB="$(printf '\t')"
+
+usage() {
+  cat <<'EOF'
+usage: pt-cmux-gather [--workspace <id|ref|index>] [-n|--dry-run] [--debug]
+
+Collapses every pane of a workspace into one pane, keeping every surface as
+a tab in the pane that is focused (or the first pane).
+
+  --workspace <id|ref|index>  workspace to gather (default: $CMUX_WORKSPACE_ID,
+                              else the workspace `cmux identify` reports)
+  -n, --dry-run               print the planned cmux calls, change nothing
+  --close-when-done           close the terminal this command is running in
+                              once it succeeds — the Command Palette entry
+                              passes this so a palette run leaves no tab
+                              behind. On a refusal or error the terminal is
+                              left open so the message can be read.
+  --debug                     dump the pane/surface layout to stderr
+  -h, --help                  this text
+EOF
+}
+
+err() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+
+WS=""
+DRY_RUN=0
+DEBUG=0
+CLOSE_WHEN_DONE=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --workspace)
+      if [ $# -lt 2 ]; then
+        err "--workspace needs a value"
+        exit 1
+      fi
+      WS="$2"; shift 2 ;;
+    --workspace=*) WS="${1#--workspace=}"; shift ;;
+    -n|--dry-run) DRY_RUN=1; shift ;;
+    --close-when-done) CLOSE_WHEN_DONE=1; shift ;;
+    --debug) DEBUG=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) err "unknown argument: $1"; usage >&2; exit 1 ;;
+  esac
+done
+
+# ------------------------------------------------------------ binaries ----
+
+resolve_jq() {
+  found="$(command -v jq 2>/dev/null)"
+  if [ -n "$found" ]; then
+    printf '%s\n' "$found"
+    return 0
+  fi
+  if [ -x /opt/homebrew/bin/jq ]; then
+    printf '%s\n' /opt/homebrew/bin/jq
+    return 0
+  fi
+  return 1
+}
+
+resolve_cmux() {
+  # An explicit override is authoritative, so tests and users never hit an
+  # installed cmux by accident.
+  if [ -n "${PTCMUX_CMUX_BIN:-}" ]; then
+    if [ -x "$PTCMUX_CMUX_BIN" ]; then
+      printf '%s\n' "$PTCMUX_CMUX_BIN"
+      return 0
+    fi
+    return 1
+  fi
+  found="$(command -v cmux 2>/dev/null)"
+  if [ -n "$found" ]; then
+    printf '%s\n' "$found"
+    return 0
+  fi
+  if [ -x /Applications/cmux.app/Contents/Resources/bin/cmux ]; then
+    printf '%s\n' /Applications/cmux.app/Contents/Resources/bin/cmux
+    return 0
+  fi
+  return 1
+}
+
+resolve_ps() {
+  # Used only by --close-when-done's safety check, so this one is optional.
+  if [ -n "${PTCMUX_PS_BIN:-}" ]; then
+    if [ -x "$PTCMUX_PS_BIN" ]; then
+      printf '%s\n' "$PTCMUX_PS_BIN"
+      return 0
+    fi
+    return 1
+  fi
+  found="$(command -v ps 2>/dev/null)"
+  if [ -n "$found" ]; then
+    printf '%s\n' "$found"
+    return 0
+  fi
+  if [ -x /bin/ps ]; then
+    printf '%s\n' /bin/ps
+    return 0
+  fi
+  return 1
+}
+
+JQ="$(resolve_jq)" || { err "jq not found; install jq (brew install jq)"; exit 1; }
+CMUX="$(resolve_cmux)" || { err "cmux binary not found (set PTCMUX_CMUX_BIN or install cmux)"; exit 1; }
+PS_BIN="$(resolve_ps || true)"
+
+# -------------------------------------------------- workspace resolution ---
+
+if [ -z "$WS" ]; then
+  WS="${CMUX_WORKSPACE_ID:-}"
+fi
+if [ -z "$WS" ]; then
+  # Covers a caller with no cmux terminal context of its own (the Command
+  # Palette may run an action with no surface to derive it from).
+  WS="$("$CMUX" identify --json 2>/dev/null | "$JQ" -r '(.focused.workspace_ref // empty)' 2>/dev/null || true)"
+fi
+if [ -z "$WS" ]; then
+  err "could not resolve a workspace; pass --workspace <id|ref|index>"
+  exit 1
+fi
+
+# ------------------------------------------------------------ cmux I/O ----
+
+cmux_call() {
+  # In dry-run mode the call is printed to stdout instead of being made, so
+  # the plan is visible and reusable. In live mode it is echoed to stderr.
+  if [ "$DRY_RUN" = "1" ]; then
+    printf 'cmux %s\n' "$*"
+    return 0
+  fi
+  err "cmux $*"
+  if ! "$CMUX" "$@" >/dev/null 2>&1; then
+    err "cmux $* failed"
+    return 1
+  fi
+  return 0
+}
+
+tree_json() {
+  # cmux's own error text is left on stderr: "workspace not found" and "no
+  # cmux running" print different things there, and that is the quickest way
+  # to tell them apart.
+  "$CMUX" tree --json --workspace "$WS"
+}
+
+# Every filter matches the workspace by ref, id, or index — the three forms
+# `cmux --workspace` accepts itself — so `--workspace 3` does not silently
+# match nothing just because the tree reports the canonical "workspace:3".
+# jq's stderr is passed through on purpose: a tree this parser cannot read
+# should say so instead of looking like an empty workspace.
+
+tree_panes() {
+  # tree_panes <tree-json>: TSV rows of pane_ref, focused (1/0), in tree order.
+  printf '%s' "$1" | "$JQ" -r --arg ws "$WS" '
+    .windows[].workspaces[]
+    | select((.ref == $ws) or (.id == $ws) or ((.index | tostring) == $ws))
+    | (.panes // [])[]
+    | [ (.ref // ""), (if .focused then "1" else "0" end) ]
+    | @tsv
+  '
+}
+
+tree_pane_surfaces() {
+  # tree_pane_surfaces <tree-json> <pane-ref>: that pane's surface refs, in
+  # tab order. A surface with no ref is skipped rather than emitted as jq's
+  # literal `null`, which would be a non-empty string the caller then tried
+  # to move.
+  printf '%s' "$1" | "$JQ" -r --arg ws "$WS" --arg p "$2" '
+    .windows[].workspaces[]
+    | select((.ref == $ws) or (.id == $ws) or ((.index | tostring) == $ws))
+    | (.panes // [])[]
+    | select((.ref // "") == $p)
+    | (.surfaces // [])[]
+    | (.ref // "")
+  ' | grep .
+}
+
+tree_focused_pane() {
+  printf '%s' "$1" | "$JQ" -r --arg ws "$WS" '
+    [ .windows[].workspaces[]
+      | select((.ref == $ws) or (.id == $ws) or ((.index | tostring) == $ws))
+      | (.panes // [])[]
+      | select(.focused == true)
+      | (.ref // "")
+    ] | .[0] // empty
+  '
+}
+
+# ------------------------------------------------------------- cleanup ----
+
+own_tty() {
+  # own_tty: the tty of the terminal this command is running in, or nothing
+  # when it has none (run detached, from a non-terminal, or from a context
+  # without a controlling tty). PTCMUX_OWN_TTY is authoritative when set —
+  # including when it is set to empty, which means "no tty here" (the same
+  # set-but-unusable convention as PTCMUX_CMUX_BIN).
+  if [ -n "${PTCMUX_OWN_TTY+set}" ]; then
+    printf '%s\n' "${PTCMUX_OWN_TTY#/dev/}"
+    return 0
+  fi
+  value="$(tty 2>/dev/null)" || value=""
+  case "$value" in
+    ''|'not a tty') return 0 ;;
+  esac
+  printf '%s\n' "${value#/dev/}"
+}
+
+tty_runs_polytoken() {
+  # tty_runs_polytoken <tty>: is a polytoken process on that tty? Best effort
+  # — without a usable ps this says "no". The caller only consults it to avoid
+  # closing the terminal hosting the session.
+  tty="$1"
+  [ -n "$tty" ] || return 1
+  [ -n "$PS_BIN" ] || return 1
+  comms="$("$PS_BIN" -t "$tty" -o pid=,comm= 2>/dev/null || true)"
+  while read -r _pid cname; do
+    [ -n "$cname" ] || continue
+    base="${cname##*/}"
+    base="${base#-}"
+    base="$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]')"
+    if [ "$base" = "polytoken" ]; then
+      return 0
+    fi
+  done <<<"$comms"
+  return 1
+}
+
+close_own_surface() {
+  # Close the terminal this command is running in. The Command Palette entry
+  # passes --close-when-done so that triggering the action there leaves no tab
+  # behind; cmux exports CMUX_SURFACE_ID into the shells it starts, which is
+  # what identifies that terminal.
+  #
+  # Only ever reached on the success path, and every refusal below leaves the
+  # terminal open on purpose so the message is readable. `cmux close-surface`
+  # with no --surface would close whatever is *focused*, which is why an unset
+  # CMUX_SURFACE_ID is a refusal rather than a bare call.
+  if [ -z "${CMUX_SURFACE_ID:-}" ]; then
+    err "--close-when-done: CMUX_SURFACE_ID is unset, so this terminal cannot be identified; leaving it open"
+    return 0
+  fi
+  # Close only when this terminal has been positively identified *and* is not
+  # the one hosting the session. With no tty of our own (detached, or a caller
+  # with no controlling terminal) there is nothing to compare against, and
+  # "leave the tab alone" is always the safe answer.
+  own_tty_name="$(own_tty)"
+  if [ -z "$own_tty_name" ]; then
+    err "--close-when-done: cannot identify the terminal this is running in; leaving it open"
+    return 0
+  fi
+  if tty_runs_polytoken "$own_tty_name"; then
+    err "--close-when-done: refusing to close the terminal hosting the Polytoken session"
+    return 0
+  fi
+  if [ "$DRY_RUN" = "1" ]; then
+    printf 'cmux close-surface --surface %s\n' "$CMUX_SURFACE_ID"
+    return 0
+  fi
+  if ! "$CMUX" close-surface --surface "$CMUX_SURFACE_ID" >/dev/null 2>&1; then
+    err "--close-when-done: could not close this terminal ($CMUX_SURFACE_ID)"
+  fi
+  return 0
+}
+
+finish() {
+  # finish <exit-code>: on success, honour --close-when-done; then exit.
+  # Errors exit without closing, so a failed run keeps its message on screen.
+  code="$1"
+  if [ "$code" -eq 0 ] && [ "$CLOSE_WHEN_DONE" = "1" ]; then
+    close_own_surface
+  fi
+  exit "$code"
+}
+
+# ----------------------------------------------------------- inspection ---
+
+TREE="$(tree_json || true)"
+if [ -z "$TREE" ]; then
+  err "could not read the cmux tree for workspace ${WS:-<unresolved>} (cmux rejected that workspace, or is not running)"
+  exit 1
+fi
+
+panes="$(tree_panes "$TREE")" || panes=""
+pane_count="$(printf '%s' "$panes" | grep -c . || true)"
+
+# "That workspace is not here" and "that workspace has no panes" need
+# different fixes, so they get different messages.
+ws_present="$(printf '%s' "$TREE" | "$JQ" -r --arg ws "$WS" '
+  [ .windows[].workspaces[]
+    | select((.ref == $ws) or (.id == $ws) or ((.index | tostring) == $ws)) ] | length
+')" || ws_present=""
+case "$ws_present" in
+  ''|*[!0-9]*)
+    err "could not read the workspace list out of cmux's tree"
+    exit 1 ;;
+esac
+if [ "$ws_present" -eq 0 ]; then
+  err "workspace $WS is not in cmux's tree; --workspace takes a ref (workspace:3), an id, or an index"
+  exit 1
+fi
+
+if [ "$pane_count" -eq 0 ]; then
+  err "workspace ${WS} has no panes in cmux's tree"
+  exit 1
+fi
+
+if [ "$pane_count" -eq 1 ]; then
+  printf '%s: already gathered in %s (1 pane)\n' "$PROG" "$WS"
+  finish 0
+fi
+
+target="$(tree_focused_pane "$TREE")"
+if [ -z "$target" ]; then
+  # No pane is marked focused (e.g. the caller is not in this workspace):
+  # fall back to the first pane in tree order.
+  target="$(printf '%s' "$panes" | head -n 1 | cut -f1)"
+  err "no focused pane reported; using $target"
+fi
+
+if [ "$DEBUG" = "1" ]; then
+  while IFS="$TAB" read -r p_ref p_focused; do
+    [ -n "$p_ref" ] || continue
+    err "debug: pane $p_ref focused=$p_focused surfaces: $(tree_pane_surfaces "$TREE" "$p_ref" | tr '\n' ' ')"
+  done <<<"$panes"
+  err "debug: target=$target"
+fi
+
+# ----------------------------------------------------------------- plan ---
+
+# Order is fixed up front from the first read, so panes disappearing as their
+# last surface leaves cannot disturb the iteration.
+last="$(tree_pane_surfaces "$TREE" "$target" | tail -n 1)"
+PLAN=""
+moved=0
+
+while IFS="$TAB" read -r p_ref p_focused; do
+  [ -n "$p_ref" ] || continue
+  [ "$p_ref" = "$target" ] && continue
+  surfaces="$(tree_pane_surfaces "$TREE" "$p_ref")"
+  [ -n "$surfaces" ] || continue
+  while IFS= read -r s_ref; do
+    [ -n "$s_ref" ] || continue
+    PLAN="$PLAN$s_ref$TAB$last"$'\n'
+    last="$s_ref"
+    moved=$((moved + 1))
+  done <<<"$surfaces"
+done <<<"$panes"
+
+if [ "$moved" -eq 0 ]; then
+  if [ "$DRY_RUN" = "1" ]; then
+    err "dry run: nothing to move; $((pane_count - 1)) pane(s) are already empty"
+    finish 0
+  fi
+  err "warning: nothing to move, but $((pane_count - 1)) pane(s) beyond $target still exist"
+  printf '%s: no surfaces moved in %s\n' "$PROG" "$WS"
+  finish 0
+fi
+
+# -------------------------------------------------------------- execute ---
+
+while IFS="$TAB" read -r s_ref after_ref; do
+  [ -n "$s_ref" ] || continue
+  if [ -n "$after_ref" ]; then
+    cmux_call move-surface --surface "$s_ref" --pane "$target" --after "$after_ref" --focus false || exit 1
+  else
+    cmux_call move-surface --surface "$s_ref" --pane "$target" --focus false || exit 1
+  fi
+done <<<"$PLAN"
+
+if [ "$DRY_RUN" = "1" ]; then
+  err "dry run: nothing changed; $moved surface(s) would move into $target"
+  finish 0
+fi
+
+# --------------------------------------------------------------- verify ---
+
+# cmux closes an emptied pane, but that too commits asynchronously — the
+# same lag that makes a fast caller's single re-read untrustworthy after
+# split-off. Panes the tree still shows right after the last move are
+# usually already dying; poll before reporting them as survivors. If the
+# tree goes quiet (an endpoint error, cmux quitting) the deadline still
+# returns and the run is judged on the last read, not on a hang.
+deadline=$(( $(date +%s) + 3 ))
+leftovers=""
+TREE2=""
+while :; do
+  TREE2="$(tree_json || true)"
+  leftovers=""
+  if [ -n "$TREE2" ]; then
+    leftovers="$(printf '%s' "$TREE2" | "$JQ" -r --arg ws "$WS" --arg t "$target" '
+      [ .windows[].workspaces[]
+        | select((.ref == $ws) or (.id == $ws) or ((.index | tostring) == $ws))
+        | (.panes // [])[]
+        | select((.ref // "") != $t)
+        | (.ref // "")
+      ] | join(" ")
+    ' || true)"
+    [ -z "$leftovers" ] && break
+  fi
+  [ "$(date +%s)" -ge "$deadline" ] && break
+  sleep 0.05
+done
+if [ -z "$TREE2" ]; then
+  err "warning: could not re-read the tree to verify; $moved surface(s) moved into $target"
+  finish 0
+fi
+if [ -n "$leftovers" ]; then
+  err "warning: pane(s) still present after gathering: $leftovers (cmux did not close them)"
+fi
+
+printf '%s: gathered %s surface(s) into %s in %s\n' "$PROG" "$moved" "$target" "$WS"
+finish 0
